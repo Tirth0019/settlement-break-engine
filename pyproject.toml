@@ -1,0 +1,38 @@
+[project]
+name = "sbe"
+version = "0.1.0"
+description = "Settlement Break Engine — an LLM investigator + independent verifier over a daily settlement reconciliation close, with a roll-forward control that must tie to zero."
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.7",        # structured agent I/O — verdict enum, evidence schema
+    "pyyaml>=6.0",          # fee_schedule.yaml, banking_calendar.yaml
+    "python-dotenv>=1.0",   # .env loading
+    "typer>=0.12",          # CLI: sbe generate / run / score / freeze
+    "rich>=13.7",           # console tables for the daily check + demo
+    "pandas>=2.2",          # per-archetype scoring tables, seed manifests
+    "numpy>=1.26",          # calibration: reliability curve, ECE
+    "anthropic>=0.34",      # model family A — keep even if unused by the other family
+    "openai>=1.40",         # model family B — swap/remove once L2/L3 are locked
+    "faker>=25.0",          # merchant names / realistic free-text narration
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "pytest-cov>=5.0",
+    "hypothesis>=6.100",    # property tests: self_check == 0.00 across random inputs
+    "ruff>=0.5",
+]
+
+[project.scripts]
+sbe = "sbe.cli:app"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["sbe*"]

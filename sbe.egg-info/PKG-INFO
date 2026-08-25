@@ -1,0 +1,22 @@
+Metadata-Version: 2.4
+Name: sbe
+Version: 0.1.0
+Summary: Settlement Break Engine — an LLM investigator + independent verifier over a daily settlement reconciliation close, with a roll-forward control that must tie to zero.
+Requires-Python: >=3.11
+License-File: LICENSE
+Requires-Dist: pydantic>=2.7
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: python-dotenv>=1.0
+Requires-Dist: typer>=0.12
+Requires-Dist: rich>=13.7
+Requires-Dist: pandas>=2.2
+Requires-Dist: numpy>=1.26
+Requires-Dist: anthropic>=0.34
+Requires-Dist: openai>=1.40
+Requires-Dist: faker>=25.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.2; extra == "dev"
+Requires-Dist: pytest-cov>=5.0; extra == "dev"
+Requires-Dist: hypothesis>=6.100; extra == "dev"
+Requires-Dist: ruff>=0.5; extra == "dev"
+Dynamic: license-file

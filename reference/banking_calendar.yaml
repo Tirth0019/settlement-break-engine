@@ -1,0 +1,52 @@
+# 2026 bank holidays for settlement-day resolution.
+# National list = widely observed NI Act / all-India closures.
+# Gujarat = the state used by STATE_HOLIDAY_SHIFT (official Gujarat bank
+# holiday notification / CCI IFSC public list). Sundays + 2nd & 4th Saturdays
+# are always non-settlement days (enforced in banking_calendar tool, not listed).
+#
+# Sources (cross-check before hold-out freeze):
+#   https://rbi.org.in/Scripts/HolidayMatrixDisplay.aspx
+#   Gujarat NI Act bank holiday notification 2026
+
+rules:
+  closed_on_sundays: true
+  closed_on_second_and_fourth_saturdays: true
+  standard_settlement_lag_banking_days: 2   # T+2 in banking days, not calendar days
+
+national_holidays_2026:
+  - "2026-01-26"   # Republic Day
+  - "2026-04-01"   # Annual closing of bank accounts (common NI Act holiday)
+  - "2026-04-03"   # Good Friday
+  - "2026-08-15"   # Independence Day
+  - "2026-10-02"   # Gandhi Jayanti
+  - "2026-12-25"   # Christmas
+
+state_holidays_2026:
+  # Primary state for STATE_HOLIDAY_SHIFT — Gujarat-only days shift settlement
+  # for Gujarat-registered merchants and not for others in the same file.
+  Gujarat:
+    - "2026-01-14"   # Makar Sankranti / Uttarayan
+    - "2026-03-04"   # Holi 2nd day — Dhuleti
+    - "2026-03-21"   # Id-Ul-Fitr (Ramzan Id)
+    - "2026-03-26"   # Shree Ram Navami
+    - "2026-03-31"   # Mahavir Janma Kalyanak
+    - "2026-04-01"   # Annual closing (Gujarat banks / treasury)
+    - "2026-04-03"   # Good Friday
+    - "2026-04-14"   # Dr. Babasaheb Ambedkar Jayanti
+    - "2026-05-27"   # Eid-Ul-Adha (Bakri Eid)
+    - "2026-08-28"   # Raksha Bandhan
+    - "2026-09-04"   # Janmashtami
+    - "2026-09-15"   # Samvatsari
+    - "2026-10-20"   # Dussehra (Vijaya Dashami)
+    - "2026-10-31"   # Sardar Vallabhbhai Patel Jayanti
+    - "2026-11-10"   # Vikram Samvat New Year (Diwali itself is Sunday 08-Nov)
+    - "2026-12-25"   # Christmas
+
+  # Thin contrast set so generator can place non-Gujarat merchants.
+  Maharashtra:
+    - "2026-02-19"   # Chhatrapati Shivaji Maharaj Jayanti
+    - "2026-03-03"   # Holi (second day) — MH; Gujarat observes Dhuleti next day
+    - "2026-05-01"   # Maharashtra Day / Labour Day
+    - "2026-09-14"   # Ganesh Chaturthi
+
+bank_cutoff_ist: "18:00"   # post-cutoff txns roll to next banking day

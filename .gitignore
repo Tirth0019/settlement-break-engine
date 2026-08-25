@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+sbe/generator/seeds/*
+!sbe/generator/seeds/.gitkeep
+runs/*
+!runs/.gitkeep
+*.db
+.pytest_cache/
+.coverage
+htmlcov/

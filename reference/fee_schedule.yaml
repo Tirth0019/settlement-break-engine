@@ -1,0 +1,27 @@
+# Single shared schedule for generator archetypes AND fee_recompute.
+# Plausible Razorpay / Indian-PG public pricing (2025–26 range), not a contractual quote.
+# GST applies on fees; TDS §194-O applies on GROSS settlement value.
+
+mdr:
+  upi: 0.0000              # zero-MDR under current PSS Act mandate
+  debit_card: 0.0090       # mid of typical domestic debit 0.40–0.90%
+  card: 0.0200             # domestic credit / flat "cards" plan ~2.00%
+  netbanking: 0.0200       # often bundled with cards on flat plans
+  wallet: 0.0200
+  international: 0.0300    # intl cards ~3.0% (before FX markup)
+
+gst_rate: 0.18             # 18% GST on MDR / surcharge / chargeback fee
+
+tds_194o:
+  rate: 0.001              # 0.1% on gross (w.e.f. 01-Oct-2024; was 1%)
+  threshold_annual: 500000 # ₹5,00,000 aggregate FY threshold (specified persons)
+
+instant_settlement:
+  surcharge: 0.0030        # ~0.30% premium for T+0 vs standard T+2
+
+chargeback:
+  flat_fee: 400.00         # ₹400 flat (matches ARCHITECTURE break-packet example)
+
+rolling_reserve:
+  pct: 0.10                # 10% hold (common high-risk band; 5–10% market range)
+  hold_days: 90
