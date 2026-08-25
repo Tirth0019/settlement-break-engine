@@ -21,12 +21,14 @@ CREATE TABLE IF NOT EXISTS runs (
 CREATE TABLE IF NOT EXISTS breaks (
     break_id        TEXT PRIMARY KEY,
     seed            TEXT NOT NULL,
+    fingerprint     TEXT NOT NULL,  -- stable natural key for idempotent re-runs
     first_seen_run  TEXT NOT NULL,
     last_updated_run TEXT NOT NULL,
     status          TEXT NOT NULL CHECK (status IN ("OPEN","RESOLVED","WRITTEN_OFF","ESCALATED")),
     merchant_id     TEXT NOT NULL,
     side            TEXT NOT NULL CHECK (side IN ("BANK_ONLY","LEDGER_ONLY","SETTLEMENT_ONLY","AMOUNT_MISMATCH")),
     amount_delta    TEXT NOT NULL,
+    match_key       TEXT,           -- UTR / synthetic key for late-arrival join
     age_days        INTEGER NOT NULL DEFAULT 0,
     ageing_bucket   TEXT,
     verdict         TEXT,
@@ -39,8 +41,17 @@ CREATE TABLE IF NOT EXISTS breaks (
     verifier_reason TEXT,
     verifier_model  TEXT,
     ground_truth_archetype TEXT,   -- NEVER read by agent code, join in scoring only
-    proposed_je_json TEXT
+    proposed_je_json TEXT,
+    close_reason    TEXT,
+    UNIQUE (seed, fingerprint)
 );
+
+CREATE INDEX IF NOT EXISTS idx_breaks_open_merchant
+    ON breaks (seed, merchant_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_breaks_match_key
+    ON breaks (seed, match_key)
+    WHERE match_key IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS audit_log (
     audit_id        INTEGER PRIMARY KEY AUTOINCREMENT,
