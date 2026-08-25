@@ -44,8 +44,43 @@ def validate(seed: str = "1001"):
 
 @app.command()
 def run(seed: str = "1001", date: str = None):
-    """Run the full L1-L7 pipeline for one day (or all days if date omitted)."""
-    raise NotImplementedError
+    """Run L1+L2+L5 for one day (YYYY-MM-DD) or all days if date omitted."""
+    from sbe.config import DB_PATH
+    from sbe.db.connection import get_connection
+    from sbe.engine.pipeline import run_day, run_seed
+    from sbe.generator.seed import SEEDS_ROOT
+
+    if not (SEEDS_ROOT / seed / "manifest.json").exists():
+        raise typer.BadParameter(f"seed {seed} missing — run sbe generate first")
+
+    db_path = Path(DB_PATH).parent / f"sbe_{seed}.db"
+    if db_path.exists() and date is None:
+        db_path.unlink()
+    conn = get_connection(str(db_path))
+
+    if date:
+        manifest = __import__("json").loads(
+            (SEEDS_ROOT / seed / "manifest.json").read_text(encoding="utf-8")
+        )
+        start = __import__("datetime").date.fromisoformat(manifest["start_date"])
+        run_d = __import__("datetime").date.fromisoformat(date)
+        day = (run_d - start).days + 1
+        if day < 1:
+            raise typer.BadParameter(f"date {date} is before seed start {start}")
+        result = run_day(conn, seed=seed, day=day)
+        rprint(
+            f"[green]run OK[/green] seed={seed} day={day} clear_rate="
+            f"{result['clear_rate']:.1%} ties={result['certificate']['ties']}"
+        )
+    else:
+        results = run_seed(conn, seed=seed)
+        clears = [r["clear_rate"] for r in results]
+        avg = sum(clears) / len(clears) if clears else 0
+        rprint(
+            f"[green]run OK[/green] seed={seed} days={len(results)} "
+            f"avg_clear_rate={avg:.1%} all_tied={all(r['certificate']['ties'] for r in results)}"
+        )
+    conn.close()
 
 
 @app.command()
@@ -60,11 +95,13 @@ def check(what: str, seed: str = "1001", day: int = None):
     if what == "idempotency":
         _check_idempotency(seed=seed, day=day or 1)
     elif what == "rollforward":
-        raise NotImplementedError("rollforward check arrives Day 4")
+        _check_rollforward(seed=seed, day=day)
     elif what == "residuals":
         raise NotImplementedError("residuals check arrives with L3")
     else:
-        raise typer.BadParameter(f"unknown check {what!r}; expected idempotency|rollforward|residuals")
+        raise typer.BadParameter(
+            f"unknown check {what!r}; expected idempotency|rollforward|residuals"
+        )
 
 
 def _check_idempotency(seed: str, day: int) -> None:
@@ -91,7 +128,6 @@ def _check_idempotency(seed: str, day: int) -> None:
         },
     ]
 
-    # Isolated DB so the check is hermetic and re-runnable.
     db_path = Path(DB_PATH).parent / f"idempotency_check_{seed}_day{day:02d}.db"
     if db_path.exists():
         db_path.unlink()
@@ -105,6 +141,45 @@ def _check_idempotency(seed: str, day: int) -> None:
     if snap1 != snap2:
         raise SystemExit(f"IDEMPOTENCY FAIL seed={seed} day={day}: snapshots differ")
     rprint(f"[green]idempotency OK[/green] seed={seed} day={day} db={db_path.name}")
+
+
+def _check_rollforward(seed: str, day: int | None) -> None:
+    """Run L1+L2+L5 and assert the roll-forward certificate ties."""
+    from sbe.config import DB_PATH
+    from sbe.db.connection import get_connection
+    from sbe.engine.l5_rollforward import RollForwardBreak
+    from sbe.engine.pipeline import run_day, run_seed
+    from sbe.generator.seed import SEEDS_ROOT
+
+    if not (SEEDS_ROOT / seed / "manifest.json").exists():
+        raise typer.BadParameter(f"seed {seed} missing — run sbe generate first")
+
+    db_path = Path(DB_PATH).parent / f"rollforward_check_{seed}.db"
+    if db_path.exists():
+        db_path.unlink()
+    conn = get_connection(str(db_path))
+    try:
+        if day is not None:
+            # Need prior days for opening balance continuity
+            for d in range(1, day + 1):
+                result = run_day(conn, seed=seed, day=d)
+            cert = result["certificate"]
+            rprint(
+                f"[green]rollforward OK[/green] seed={seed} day={day} "
+                f"closing={cert['closing_count']}/{cert['closing_value']}"
+            )
+        else:
+            results = run_seed(conn, seed=seed)
+            assert all(r["certificate"]["ties"] for r in results)
+            last = results[-1]["certificate"]
+            rprint(
+                f"[green]rollforward OK[/green] seed={seed} days={len(results)} "
+                f"final_closing={last['closing_count']}/{last['closing_value']}"
+            )
+    except RollForwardBreak as exc:
+        raise SystemExit(str(exc)) from exc
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

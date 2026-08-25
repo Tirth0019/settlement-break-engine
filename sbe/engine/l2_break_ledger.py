@@ -375,3 +375,42 @@ def ingest_day_breaks(
 
     age_breaks(conn, run_date, seed=seed)
     return {"opened": opened, "closed": closed}
+
+
+def write_off_break(
+    conn: sqlite3.Connection,
+    break_id: str,
+    run_date,
+    *,
+    reason: str = "materiality",
+) -> None:
+    """Mark an OPEN break as WRITTEN_OFF (materiality path)."""
+    run_s = _fmt_date(run_date)
+    row = conn.execute(
+        "SELECT status FROM breaks WHERE break_id = ?", (break_id,)
+    ).fetchone()
+    if row is None:
+        raise KeyError(f"unknown break_id {break_id}")
+    prior = row[0]
+    conn.execute(
+        """
+        UPDATE breaks
+           SET status = 'WRITTEN_OFF',
+               last_updated_run = ?,
+               residual_unexplained = '0.00',
+               close_reason = ?,
+               verdict = COALESCE(verdict, 'MATCH')
+         WHERE break_id = ?
+        """,
+        (run_s, reason, break_id),
+    )
+    append_audit(
+        conn,
+        break_id,
+        who="l1_deterministic",
+        what="materiality_write_off",
+        prior_value=prior,
+        new_value=json.dumps({"status": "WRITTEN_OFF", "reason": reason, "run_date": run_s}),
+        at=run_s,
+    )
+    conn.commit()
