@@ -2,19 +2,76 @@
 Archetype: FX_ROUNDING_DRIFT
 Lifecycle: SAME_DAY
 
-TODO (BUILD_PLAN Phase 1 / ROADMAP.md Day 1-2): implement using sbe.money
-for every arithmetic step. If this archetype involves any fee, GST, or TDS
-figure, call sbe.engine.tools.fee_recompute for it rather than computing it
-inline here — the generator and the engine sharing one math path is what
-prevents them from silently disagreeing (BUILD_PLAN Risk R1).
-
-self_check must be Decimal("0.00"): recompute this archetype expected gap
-independently of however the rows were constructed, and assert they match.
+Sub-rupee drift on international settlement — within materiality if tiny,
+but generated as an explainable paise-level gap on the fee path.
 """
+from decimal import Decimal
+
+from sbe.engine.tools.fee_recompute import recompute_fee, recompute_gst_on_fee
+from sbe.generator.archetypes._helpers import (
+    amount_delta,
+    bank_credit_row,
+    fmt_date,
+    fmt_money,
+    make_utr,
+    pick_gross,
+    sale_and_fee_ledger,
+    settlement_net_components,
+    settlement_row,
+)
 from sbe.generator.archetypes.base import ArchetypeResult
+from sbe.money import ZERO, money
 
 
 def generate(rng, merchant, date, fee_schedule, calendar) -> ArchetypeResult:
-    raise NotImplementedError(
-        "TODO: implement FX_ROUNDING_DRIFT — see ARCHITECTURE.md section 4 and BUILD_PLAN Phase 1"
+    gross = pick_gross(rng, 8000, 40000)
+    fee = recompute_fee(gross, "international", fee_schedule)
+    fee_gst = recompute_gst_on_fee(fee, fee_schedule)
+    exact_net = settlement_net_components(gross, fee, fee_gst, ZERO)
+    # Bank posts with FX conversion rounding drift of a few paise
+    drift = money(Decimal(rng.choice(["0.01", "0.02", "0.03", "-0.01", "-0.02"])))
+    bank_amount = money(exact_net + drift)
+
+    utr = make_utr(rng)
+    settlement = settlement_row(
+        settlement_id=f"STL-{fmt_date(date).replace('-', '')}-{rng.randint(1000, 9999)}",
+        utr=utr,
+        merchant_id=merchant,
+        settled_at=date,
+        gross=gross,
+        fee=fee,
+        fee_gst=fee_gst,
+        tds=ZERO,
+        settlement_type="international",
+    )
+    bank = bank_credit_row(
+        value_date=date,
+        posting_date=date,
+        narration=f"FX NEFT {utr}",
+        amount=bank_amount,
+        bank_ref=f"BNK-{rng.randint(100000, 999999)}",
+    )
+    ledger, *_ = sale_and_fee_ledger(rng, date, gross, fee, fee_gst)
+
+    implied = amount_delta([bank], ledger)
+    expected = drift
+    self_check = money(implied - expected)
+
+    return ArchetypeResult(
+        rows={
+            "bank_statement": [bank],
+            "settlement_report": [settlement],
+            "merchant_ledger": ledger,
+        },
+        ground_truth={
+            "archetype": "FX_ROUNDING_DRIFT",
+            "correct_verdict": "MATCH",
+            "correct_residual": ZERO,
+            "amount_delta": fmt_money(expected),
+            "lifecycle": "SAME_DAY",
+            "fx_drift": fmt_money(drift),
+            "exact_net": fmt_money(exact_net),
+            "bank_amount": fmt_money(bank_amount),
+        },
+        self_check=self_check,
     )

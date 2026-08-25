@@ -219,3 +219,83 @@ def naive_tds_on_net(gross: Decimal, fee: Decimal, fee_schedule: dict) -> Decima
     net_before_tds = money(gross - fee)
     rate = Decimal(str(fee_schedule["tds_194o"]["rate"]))
     return money(net_before_tds * rate)
+
+
+def reserve_hold_amount(gross: Decimal, fee_schedule: dict) -> Decimal:
+    pct = Decimal(str(fee_schedule["rolling_reserve"]["pct"]))
+    return money(money(gross) * pct)
+
+
+def empty_sources() -> dict:
+    return {"bank_statement": [], "settlement_report": [], "merchant_ledger": []}
+
+
+def with_follow_up(primary: dict, day_offset: int, follow: dict) -> dict:
+    """Attach a later-day payload for MULTI_DAY archetypes."""
+    out = dict(primary)
+    out["follow_ups"] = [{"day_offset": day_offset, **follow}]
+    return out
+
+
+def flatten_result_rows(result) -> dict:
+    """Collapse primary + follow_up rows for seed-wide validation."""
+    bank = list(result.rows.get("bank_statement") or [])
+    sett = list(result.rows.get("settlement_report") or [])
+    ledg = list(result.rows.get("merchant_ledger") or [])
+    for fu in result.rows.get("follow_ups") or []:
+        bank.extend(fu.get("bank_statement") or [])
+        sett.extend(fu.get("settlement_report") or [])
+        ledg.extend(fu.get("merchant_ledger") or [])
+    return {"bank_statement": bank, "settlement_report": sett, "merchant_ledger": ledg}
+
+
+def settlement_row_integrity(row: dict) -> Decimal:
+    """Return residual of stated net vs recomputed components (must be 0)."""
+    recomputed = settlement_net_components(
+        money(row["gross_amount"]),
+        money(row["fee"]),
+        money(row["fee_gst"]),
+        money(row["tds"]),
+        money(row.get("adjustments") or ZERO),
+        money(row.get("reserve_hold") or ZERO),
+        money(row.get("reserve_release") or ZERO),
+    )
+    return money(money(row["net_amount"]) - recomputed)
+
+
+def sale_and_fee_ledger(rng, date, gross: Decimal, fee: Decimal, fee_gst: Decimal | None = None, *, omit_gst: bool = False):
+    order_id = f"ORD-{rng.randint(100000, 999999)}"
+    payment_id = f"PAY-{rng.randint(100000, 999999)}"
+    rows = [
+        ledger_row(
+            entry_id=f"LE-{rng.randint(100000, 999999)}",
+            order_id=order_id,
+            payment_id=payment_id,
+            entry_date=date,
+            entry_type="sale",
+            amount=gross,
+            description=f"Card sale {order_id}",
+        ),
+        ledger_row(
+            entry_id=f"LE-{rng.randint(100000, 999999)}",
+            order_id=order_id,
+            payment_id=payment_id,
+            entry_date=date,
+            entry_type="fee",
+            amount=fee,
+            description="PG MDR",
+        ),
+    ]
+    if fee_gst is not None and not omit_gst:
+        rows.append(
+            ledger_row(
+                entry_id=f"LE-{rng.randint(100000, 999999)}",
+                order_id=order_id,
+                payment_id=payment_id,
+                entry_date=date,
+                entry_type="fee",
+                amount=fee_gst,
+                description="GST on PG fee",
+            )
+        )
+    return rows, order_id, payment_id
