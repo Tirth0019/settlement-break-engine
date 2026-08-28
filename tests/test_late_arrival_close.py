@@ -55,6 +55,10 @@ def test_break_opened_day1_closes_day3_on_late_credit(tmp_path):
     assert row[1] == "late_arrival"
     assert row[2] == "0.00"
     assert row[3] == DAY3.isoformat()
+    verdict = conn.execute(
+        "SELECT verdict FROM breaks WHERE break_id = ?", (opened,)
+    ).fetchone()[0]
+    assert verdict is None  # L2 close must not synthesize an L3 verdict
 
     assert count_breaks(conn, SEED) == 1  # no spurious second break
     assert count_breaks(conn, SEED, status="OPEN") == 0

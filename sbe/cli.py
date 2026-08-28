@@ -3,6 +3,7 @@ CLI entrypoint — `sbe <command>` (installed via pyproject [project.scripts]).
 """
 from __future__ import annotations
 
+import json
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -84,9 +85,187 @@ def run(seed: str = "1001", date: str = None):
 
 
 @app.command()
-def score(seed: str = "1001", print_table: bool = False):
-    """Print headline metrics + per-archetype table."""
-    raise NotImplementedError
+def investigate(
+    seed: str = "1001",
+    limit: int = typer.Option(None, help="Max OPEN breaks to investigate"),
+    through_day: int = typer.Option(
+        None, "--through-day", help="Run L1+L2+L5 through this day first"
+    ),
+):
+    """Run L3 investigator on OPEN breaks (stratified; L2-resolved breaks skipped)."""
+    from sbe.config import DB_PATH, INVESTIGATE_PER_RUN_CAP
+    from sbe.db.connection import get_connection
+    from sbe.engine.l3_investigator import investigate_open_breaks
+    from sbe.engine.pipeline import run_day, run_seed
+    from sbe.generator.seed import SEEDS_ROOT
+
+    if not (SEEDS_ROOT / seed / "manifest.json").exists():
+        raise typer.BadParameter(f"seed {seed} missing — run sbe generate first")
+
+    db_path = Path(DB_PATH).parent / f"sbe_{seed}.db"
+    conn = get_connection(str(db_path))
+
+    if through_day is not None:
+        for d in range(1, through_day + 1):
+            run_day(conn, seed=seed, day=d)
+    elif not db_path.exists() or conn.execute(
+        "SELECT COUNT(*) FROM runs WHERE seed=?", (seed,)
+    ).fetchone()[0] == 0:
+        run_seed(conn, seed=seed)
+
+    verdicts, report = investigate_open_breaks(
+        conn, seed=seed, limit=limit if limit is not None else INVESTIGATE_PER_RUN_CAP
+    )
+    from sbe.scoring.harness import format_pass1_report
+
+    rprint(format_pass1_report(report))
+    conn.close()
+
+    if not verdicts:
+        rprint(f"[yellow]no OPEN breaks[/yellow] seed={seed}")
+        return
+
+    by_verdict: dict[str, int] = {}
+    for v in verdicts:
+        by_verdict[v.verdict] = by_verdict.get(v.verdict, 0) + 1
+    bad_match = [
+        v
+        for v in verdicts
+        if v.verdict == "MATCH" and v.residual_unexplained != "0.00"
+    ]
+    if bad_match:
+        raise SystemExit(
+            f"contract violation: {len(bad_match)} MATCH verdict(s) with non-zero residual"
+        )
+    rprint(
+        f"[green]investigate OK[/green] seed={seed} n={len(verdicts)} "
+        f"verdicts={by_verdict}"
+    )
+
+
+@app.command()
+def score(
+    seed: str = "1001",
+    print_table: bool = False,
+    skip_investigate: bool = False,
+    investigate_limit: int = typer.Option(
+        None,
+        "--investigate-limit",
+        help="Cap L3 calls (stratified across archetypes). Default: INVESTIGATE_PER_RUN_CAP.",
+    ),
+):
+    """Print headline metrics + per-archetype table (L3 verdicts only)."""
+    from sbe.config import DB_PATH, INVESTIGATE_PER_RUN_CAP
+    from sbe.db.connection import get_connection
+    from sbe.engine.l3_investigator import investigate_open_breaks
+    from sbe.generator.seed import SEEDS_ROOT
+    from sbe.scoring.harness import (
+        GATE5_ARITHMETIC_ARCHETYPES,
+        GATE5_CORE_ARITHMETIC,
+        adversarial_metrics,
+        format_pass1_report,
+        gate5_archetype_coverage,
+        leakage_recall,
+        match_residual_violations,
+        per_archetype_table,
+        value_weighted_reconciled_pct,
+    )
+
+    if not (SEEDS_ROOT / seed / "manifest.json").exists():
+        raise typer.BadParameter(f"seed {seed} missing — run sbe generate first")
+
+    db_path = Path(DB_PATH).parent / f"sbe_{seed}.db"
+    if not db_path.exists():
+        raise typer.BadParameter(f"no db for seed {seed} — run `sbe run --seed {seed}` first")
+
+    conn = get_connection(str(db_path))
+    open_no_verdict = conn.execute(
+        """
+        SELECT COUNT(*) FROM breaks
+         WHERE seed = ? AND status = 'OPEN' AND verdict IS NULL
+        """,
+        (seed,),
+    ).fetchone()[0]
+
+    if open_no_verdict and not skip_investigate:
+        cap = investigate_limit if investigate_limit is not None else INVESTIGATE_PER_RUN_CAP
+        rprint(
+            f"[cyan]investigating[/cyan] {open_no_verdict} OPEN break(s) "
+            f"(stratified cap={cap})…"
+        )
+        _, report = investigate_open_breaks(conn, seed=seed, limit=cap)
+        rprint(format_pass1_report(report))
+        if not report.pass1_core_complete:
+            rprint(
+                "[yellow]Gate 5 not ready[/yellow]: pass-1 core trio incomplete "
+                f"({', '.join(GATE5_CORE_ARITHMETIC)}) — see statuses above; "
+                "do not trust arithmetic-heavy table rows yet"
+            )
+
+    table = per_archetype_table(conn, seed)
+    vw = value_weighted_reconciled_pct(conn, seed)
+    leak = leakage_recall(conn, seed)
+    bad_match = match_residual_violations(conn, seed)
+    adv = adversarial_metrics(conn, seed)
+    g5 = gate5_archetype_coverage(conn, seed)
+    conn.close()
+
+    if bad_match:
+        raise SystemExit(
+            f"contract violation: MATCH with non-zero residual: {bad_match[:5]}"
+        )
+
+    if table.empty:
+        rprint("[yellow]no investigator verdicts yet[/yellow]")
+        return
+
+    if print_table:
+        display = table.copy()
+        if not display.empty:
+            display["acc"] = display["acc"].map(lambda x: f"{x:.1f}%")
+            display["verifier_lift"] = display["verifier_lift"].map(
+                lambda x: f"{x:+.1f}pp"
+            )
+        rprint(display.to_string(index=False))
+
+    missing_g5 = [a for a in GATE5_ARITHMETIC_ARCHETYPES if g5.get(a, 0) == 0]
+    missing_core = [a for a in GATE5_CORE_ARITHMETIC if g5.get(a, 0) == 0]
+    if missing_core:
+        rprint(
+            f"[yellow]GATE 5 core gap[/yellow]: no L3 verdict yet for "
+            f"{', '.join(missing_core)}"
+        )
+    elif missing_g5:
+        rprint(
+            f"[yellow]GATE 5 partial[/yellow]: core trio covered; still missing "
+            f"{', '.join(missing_g5)}"
+        )
+
+    leak_str = f"{leak:.1f}%" if leak == leak else "n/a"
+    rprint(
+        f"[green]score OK[/green] seed={seed} "
+        f"l3_archetypes={len(table)} value_weighted_match={vw:.1f}% "
+        f"leakage_recall={leak_str}"
+    )
+
+    if adv["n"]:
+        rprint(
+            f"  ADVERSARIAL_NARRATION (L3 n={adv['n']}): "
+            f"resisted_injection={adv['resisted_injection']}/{adv['n']} "
+            f"({adv['resisted_pct']:.1f}%) | "
+            f"correct_verdict={adv['correct_verdict']}/{adv['n']} "
+            f"({adv['correct_pct']:.1f}%)"
+        )
+        for row in adv.get("rows") or []:
+            tools = json.loads(row.get("tools_called_json") or "[]")
+            rprint(
+                f"    {row['break_id']}: verdict={row.get('verdict')} "
+                f"residual={row.get('residual_unexplained')} tools={tools}"
+            )
+            if row.get("verdict") == "MATCH" and not tools:
+                raise SystemExit(
+                    f"ADVERSARIAL auto-match: {row['break_id']} MATCH with no tools_called"
+                )
 
 
 @app.command()
@@ -97,7 +276,7 @@ def check(what: str, seed: str = "1001", day: int = None):
     elif what == "rollforward":
         _check_rollforward(seed=seed, day=day)
     elif what == "residuals":
-        raise NotImplementedError("residuals check arrives with L3")
+        _check_residuals(seed=seed)
     else:
         raise typer.BadParameter(
             f"unknown check {what!r}; expected idempotency|rollforward|residuals"
@@ -180,6 +359,35 @@ def _check_rollforward(seed: str, day: int | None) -> None:
         raise SystemExit(str(exc)) from exc
     finally:
         conn.close()
+
+
+def _check_residuals(seed: str) -> None:
+    """Assert no L3 MATCH verdict carries a non-zero residual_unexplained."""
+    from sbe.config import DB_PATH
+    from sbe.db.connection import get_connection
+    from sbe.scoring.harness import match_residual_violations
+
+    db_path = Path(DB_PATH).parent / f"sbe_{seed}.db"
+    if not db_path.exists():
+        raise typer.BadParameter(
+            f"no db for seed {seed} — run `sbe run --seed {seed}` or investigate first"
+        )
+    conn = get_connection(str(db_path))
+    bad = match_residual_violations(conn, seed)
+    n_l3 = conn.execute(
+        """
+        SELECT COUNT(DISTINCT break_id) FROM audit_log
+         WHERE who='l3_investigator' AND what='verdict'
+           AND break_id IN (SELECT break_id FROM breaks WHERE seed=?)
+        """,
+        (seed,),
+    ).fetchone()[0]
+    conn.close()
+    if bad:
+        raise SystemExit(
+            f"RESIDUALS FAIL seed={seed}: L3 MATCH with non-zero residual: {bad[:5]}"
+        )
+    rprint(f"[green]residuals OK[/green] seed={seed} l3_verdicts={n_l3}")
 
 
 if __name__ == "__main__":

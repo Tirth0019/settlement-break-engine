@@ -160,6 +160,10 @@ def generate_seed(seed: str, days: int = 10, start_date: date | None = None) -> 
             gt["merchant_state"] = state
             gt["open_day"] = day_idx
             gt["open_date"] = run_date.isoformat()
+            for srow in result.rows.get("settlement_report") or []:
+                if srow.get("utr"):
+                    gt["utr"] = srow["utr"]
+                    break
             label = gt.get("archetype", name)
             label_counts[label] += 1
 

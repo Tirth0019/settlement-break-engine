@@ -273,8 +273,7 @@ def try_late_arrival_close(
            SET status = 'RESOLVED',
                last_updated_run = ?,
                residual_unexplained = '0.00',
-               close_reason = 'late_arrival',
-               verdict = COALESCE(verdict, 'MATCH')
+               close_reason = 'late_arrival'
          WHERE break_id = ?
         """,
         (run_s, break_id),
@@ -398,8 +397,7 @@ def write_off_break(
            SET status = 'WRITTEN_OFF',
                last_updated_run = ?,
                residual_unexplained = '0.00',
-               close_reason = ?,
-               verdict = COALESCE(verdict, 'MATCH')
+               close_reason = ?
          WHERE break_id = ?
         """,
         (run_s, reason, break_id),

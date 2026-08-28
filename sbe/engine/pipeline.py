@@ -19,6 +19,7 @@ from sbe.engine.l2_break_ledger import (
     write_off_break,
 )
 from sbe.engine.l5_rollforward import check_and_certify
+from sbe.engine.tools.normalise_identifier import normalise
 from sbe.generator.seed import SEEDS_ROOT
 from sbe.money import ZERO, money
 
@@ -150,19 +151,34 @@ def run_day(conn, *, seed: str, day: int) -> dict[str, Any]:
     late_arrivals = _build_late_arrivals(conn, seed=seed, records=records)
 
     break_specs: list[dict] = []
+    match_index = None
+
+    def _gt_archetype(spec: dict) -> str | None:
+        nonlocal match_index
+        if spec.get("ground_truth_archetype"):
+            return spec["ground_truth_archetype"]
+        if match_index is None:
+            from sbe.scoring.harness import build_match_key_index
+
+            match_index = build_match_key_index(seed)
+        mk = normalise(spec.get("match_key") or "")
+        if mk and mk in match_index:
+            return match_index[mk].get("archetype")
+        return None
+
     for item in l1["residual"]:
         merchant = item.get("merchant_id") or "UNKNOWN"
         if merchant == "UNKNOWN" and item.get("settlement"):
             merchant = item["settlement"].get("merchant_id") or merchant
-        break_specs.append(
-            {
-                "merchant_id": merchant,
-                "side": item["side"],
-                "amount_delta": money(item["amount_delta"]),
-                "match_key": item.get("match_key"),
-                "ground_truth_archetype": None,
-            }
-        )
+        spec = {
+            "merchant_id": merchant,
+            "side": item["side"],
+            "amount_delta": money(item["amount_delta"]),
+            "match_key": item.get("match_key"),
+            "ground_truth_archetype": None,
+        }
+        spec["ground_truth_archetype"] = _gt_archetype(spec)
+        break_specs.append(spec)
     break_specs.extend(_reserve_hold_break_specs(l1))
 
     ingest = ingest_day_breaks(

@@ -29,3 +29,7 @@ RECORD_COUNT = 1000
 LOSS_RATIO_FALSE_MATCH_TO_FALSE_NEEDS_HUMAN = 50
 
 DB_PATH = os.getenv("SBE_DB_PATH", "./runs/sbe.db")
+
+# L3 investigate pacing (Groq free tier ~200k TPD — see docs/INVESTIGATOR_QUOTA.md)
+INVESTIGATE_PER_RUN_CAP = int(os.getenv("INVESTIGATE_PER_RUN_CAP", "40"))
+INVESTIGATE_PACE_SECONDS = float(os.getenv("INVESTIGATE_PACE_SECONDS", "1.0"))
