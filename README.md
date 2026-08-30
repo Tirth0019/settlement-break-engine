@@ -45,13 +45,33 @@ order of suspicion — see BUILD_PLAN.md Risk Register R1/R2.**
 make daily-check
 ```
 
+## Freeze boundary (`agent-freeze`, tagged Aug 31)
+
+Commits after this tag are **scoring and presentation only**. They do not change agent behaviour.
+
+| Frozen after `agent-freeze` | Still open |
+|---|---|
+| L3 / L4 prompts | Scoring, calibration, cost |
+| Tool implementations (`fee_recompute`, `decimal_calc`, query_*) | Packet / certificate render |
+| L1 matching logic | Docs, README, video |
+| Generator + archetype *implementations* | Hold-out **pool sizing** (injection rates / `--target-breaks`) |
+
+If the hold-out run surfaces a bug in a frozen path, it is recorded in `docs/KNOWN_ISSUES.md`. It is **not** patched.
+
+The published tag `agent-freeze` points at `4c5a0ac` (Day 6). The L1/L3/L4 behaviour actually frozen for scoring is commit `d3594e2`. CI checks frozen files against `d3594e2`, not the earlier tag.
+
 ## Freeze & hold-out
 
 ```bash
-make freeze     # tags agent-freeze, generates + runs seed 9999, prints headline numbers
+sbe generate --seed 9999 --dense --target-breaks 60
+sbe validate --seed 9999
+sbe run --seed 9999
+sbe investigate --seed 9999 --subsample
+sbe verify --seed 9999 --limit 20
+sbe score --seed 9999 --skip-investigate --print-table
 ```
 
-No code changes after `make freeze`. See BUILD_PLAN.md Phase 8.
+See `docs/FINAL_PLAN.md`. Do not edit `sbe/engine/l3_investigator.py` or `sbe/engine/l4_verifier.py` after the tag.
 
 ## Repo layout
 

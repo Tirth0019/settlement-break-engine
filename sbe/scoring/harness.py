@@ -51,6 +51,15 @@ SMOKE_ARCHETYPE_ORDER: tuple[str, ...] = (
     "SPLIT_SETTLEMENT",
 )
 
+# Quota subsample — hold-out (seed 9999) sized to ~50 L3 covering the pool.
+HOLDOUT_SUBSAMPLE_PLAN: dict[str, int] = {
+    "FEE_PLUS_GST": 12,
+    "TDS_194O": 12,
+    "CHARGEBACK_PLUS_FEE": 12,
+    "TRUE_LEAKAGE": 10,
+    "ADVERSARIAL_NARRATION": 4,
+}
+
 # Quota subsample — fixed n per archetype (~35 dev run). TDS/CHARGEBACK weighted.
 QUOTA_SUBSAMPLE_PLAN: dict[str, int] = {
     "TDS_194O": 12,
@@ -236,7 +245,8 @@ def select_open_breaks_quota_subsample(
     pass1_selected: dict[str, str | None] = {
         a: None for a in GATE5_CORE_ARITHMETIC
     }
-    for arch, n in QUOTA_SUBSAMPLE_PLAN.items():
+    plan = HOLDOUT_SUBSAMPLE_PLAN if seed == "9999" else QUOTA_SUBSAMPLE_PLAN
+    for arch, n in plan.items():
         if len(picked) >= total_cap:
             break
         bucket = by_arch.get(arch) or []

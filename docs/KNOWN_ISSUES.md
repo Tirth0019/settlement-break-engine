@@ -234,3 +234,19 @@ Answers *"how do you know your verifier isn't just agreeing with itself?"* — w
 | Dev L3 spent | **~15** of ~100 |
 | Hold-out reserve | **~50** — untouched |
 | Google L4 free tier | **20/day** — plan verify sparingly; hold-out only for headline lift |
+
+---
+
+## Hold-out seed 9999 (FINAL_PLAN §1.1 — generated, L3 not yet run)
+
+`sbe generate --seed 9999 --dense --target-breaks 60` → **86 records**. `validate_seed` green. `sbe run` **all_tied=True**.
+
+| OPEN labeled | n |
+|---|---|
+| CHARGEBACK_PLUS_FEE | 17 |
+| TRUE_LEAKAGE | 15 |
+| TDS_194O | 11 |
+| FEE_PLUS_GST | 10 |
+| unlabeled | 3 of 64 OPEN (4.7%) |
+
+~50 L3 covers **50/61 labelled ≈ 82%** (≥70% gate). Core trio each n≥8. `UTR_TRUNCATION` still missing from OPEN (cut). No L3 tokens spent on 9999 yet.

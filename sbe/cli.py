@@ -15,11 +15,26 @@ app = typer.Typer(help="Settlement Break Engine")
 
 
 @app.command()
-def generate(seed: str = "1001", days: int = 10, dense: bool = False):
-    """Generate a synthetic seed (ROADMAP.md Day 1-2). Use --dense for scoring pool (~450 rows)."""
+def generate(
+    seed: str = "1001",
+    days: int = 10,
+    dense: bool = False,
+    target_breaks: int = typer.Option(
+        None,
+        "--target-breaks",
+        help="Hold-out sizing: approximate labelled OPEN breaks (maps to record count).",
+    ),
+):
+    """Generate a synthetic seed. --dense for seed 2001; seed 9999 uses hold-out weights."""
     from sbe.generator.seed import generate_seed
 
-    out = generate_seed(seed=seed, days=days, dense=dense)
+    out = generate_seed(
+        seed=seed,
+        days=days,
+        dense=dense,
+        holdout=seed == "9999",
+        target_breaks=target_breaks,
+    )
     rprint(f"[green]Generated seed {seed} -> {out}[/green]")
 
 

@@ -23,7 +23,11 @@ from pathlib import Path
 from sbe.config import RECORD_COUNT
 from sbe.engine.tools.banking_calendar import load_calendar
 from sbe.engine.tools.fee_recompute import load_fee_schedule
-from sbe.generator.archetypes.registry import ARCHETYPE_WEIGHTS, DENSE_ARCHETYPE_WEIGHTS
+from sbe.generator.archetypes.registry import (
+    ARCHETYPE_WEIGHTS,
+    DENSE_ARCHETYPE_WEIGHTS,
+    HOLDOUT_ARCHETYPE_WEIGHTS,
+)
 from sbe.generator.validate_seed import validate_seed
 from sbe.money import money
 
@@ -113,7 +117,9 @@ def generate_seed(
     start_date: date | None = None,
     *,
     dense: bool = False,
+    holdout: bool = False,
     record_count: int | None = None,
+    target_breaks: int | None = None,
 ) -> Path:
     seed_int = int(seed)
     rng = random.Random(seed_int)
@@ -124,8 +130,24 @@ def generate_seed(
         # Mid-March 2026 window — includes Gujarat Dhuleti contrast nearby
         start_date = date(2026, 3, 10)
 
-    target_records = record_count if record_count is not None else (280 if dense else RECORD_COUNT)
-    weights = DENSE_ARCHETYPE_WEIGHTS if dense else ARCHETYPE_WEIGHTS
+    holdout = holdout or seed == "9999"
+    if record_count is not None:
+        target_records = record_count
+    elif target_breaks is not None:
+        # Hold-out 9999: ~70% of records become labelled OPEN (seed 9999 first pass).
+        target_records = max(days, int(round(target_breaks / 0.70)))
+    elif holdout:
+        target_records = 86
+    elif dense:
+        target_records = 280
+    else:
+        target_records = RECORD_COUNT
+    if holdout:
+        weights = HOLDOUT_ARCHETYPE_WEIGHTS
+    elif dense:
+        weights = DENSE_ARCHETYPE_WEIGHTS
+    else:
+        weights = ARCHETYPE_WEIGHTS
 
     def _pick_weighted_local():
         names, fns, wts = zip(*weights)
@@ -247,6 +269,8 @@ def generate_seed(
         "days": days,
         "start_date": start_date.isoformat(),
         "dense": dense,
+        "holdout": holdout,
+        "target_breaks": target_breaks,
         "record_count_target": target_records,
         "records_generated": sum(totals),
         "merchants": len(merchants),
@@ -258,17 +282,40 @@ def generate_seed(
 
 
 def load_seed_results_for_validate(seed: str):
-    """Re-generate in-memory (deterministic) for validate command without CSV round-trip."""
-    # validate_seed operates on ArchetypeResult objects; regenerate with same seed.
+    """Re-generate in-memory (deterministic) matching the written seed's manifest."""
+    manifest_path = SEEDS_ROOT / seed / "manifest.json"
+    dense = False
+    holdout = seed == "9999"
+    record_count = RECORD_COUNT
+    days = 10
+    start_date = date(2026, 3, 10)
+    if manifest_path.exists():
+        meta = json.loads(manifest_path.read_text(encoding="utf-8"))
+        dense = bool(meta.get("dense"))
+        holdout = bool(meta.get("holdout") or seed == "9999")
+        record_count = int(meta.get("record_count_target") or RECORD_COUNT)
+        days = int(meta.get("days") or 10)
+        if meta.get("start_date"):
+            start_date = date.fromisoformat(str(meta["start_date"])[:10])
+
     seed_int = int(seed)
     rng = random.Random(seed_int)
     fee_schedule = load_fee_schedule()
     calendar = load_calendar()
-    start_date = date(2026, 3, 10)
-    days = 10
-    per_day = max(1, RECORD_COUNT // days)
+    if holdout:
+        weights = HOLDOUT_ARCHETYPE_WEIGHTS
+    elif dense:
+        weights = DENSE_ARCHETYPE_WEIGHTS
+    else:
+        weights = ARCHETYPE_WEIGHTS
+
+    def _pick_weighted_local():
+        names, fns, wts = zip(*weights)
+        return rng.choices(list(zip(names, fns)), weights=wts, k=1)[0]
+
+    per_day = max(1, record_count // days)
     totals = [per_day] * days
-    totals[-1] += RECORD_COUNT - sum(totals)
+    totals[-1] += record_count - sum(totals)
     merchants = list(MERCHANT_STATES.keys())
     results = []
     for day_idx in range(1, days + 1):
@@ -278,8 +325,8 @@ def load_seed_results_for_validate(seed: str):
             state = MERCHANT_STATES[merchant]
             cal = dict(calendar)
             cal["_merchant_state"] = state
-            name, gen_fn = _pick_weighted(rng)
+            name, gen_fn = _pick_weighted_local()
             if name in {"ROLLING_RESERVE_HOLD", "T2_PERIOD_BOUNDARY"} and day_idx > days - 4:
-                name, gen_fn = "CLEAN", ARCHETYPE_WEIGHTS[0][1]
+                name, gen_fn = "CLEAN", weights[0][1]
             results.append(gen_fn(rng, merchant, run_date, fee_schedule, cal))
     return results

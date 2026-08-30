@@ -143,3 +143,21 @@ DENSE_ARCHETYPE_WEIGHTS: list[tuple[str, object, float]] = [
     ("DUPLICATE_UTR", duplicate_utr.generate, 0.02),
     ("FX_ROUNDING_DRIFT", fx_rounding_drift.generate, 0.01),
 ]
+
+# Hold-out seed 9999 — ~120 records, trio + TRUE_LEAKAGE dense (docs/FINAL_PLAN.md).
+# Generator config only; does not change frozen L1/L3/L4 behaviour.
+HOLDOUT_ARCHETYPE_WEIGHTS: list[tuple[str, object, float]] = [
+    ("CLEAN", generate_clean, 0.22),
+    ("FEE_PLUS_GST", fee_plus_gst.generate, 0.16),
+    ("TDS_194O", tds_194o.generate, 0.14),
+    ("CHARGEBACK_PLUS_FEE", chargeback_plus_fee.generate, 0.14),
+    ("TRUE_LEAKAGE", true_leakage.generate, 0.16),
+    ("ADVERSARIAL_NARRATION", adversarial_narration.generate, 0.04),
+    ("REFUND_NETTED", refund_netted.generate, 0.04),
+    ("INSTANT_SETTLEMENT_FEE", instant_settlement_fee.generate, 0.03),
+    ("ROLLING_RESERVE_HOLD", rolling_reserve.generate, 0.02),
+    ("T2_PERIOD_BOUNDARY", t2_period_boundary.generate, 0.02),
+    ("SPLIT_SETTLEMENT", split_settlement.generate, 0.01),
+    ("STATE_HOLIDAY_SHIFT", state_holiday_shift.generate, 0.01),
+    ("UTR_TRUNCATION", utr_truncation.generate, 0.01),
+]
