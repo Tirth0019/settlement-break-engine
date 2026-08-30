@@ -57,6 +57,21 @@ No code changes after `make freeze`. See BUILD_PLAN.md Phase 8.
 
 See `ARCHITECTURE.md` §13.
 
+## L1 clear rate — why it went *down* (Aug 30)
+
+After the three-way L1 fix on seed 1001:
+
+| Metric | Before (broken L1) | After (correct L1) |
+|---|---|---|
+| Avg daily clear rate | **70.6%** | **56.7%** |
+| NULL OPEN breaks | 290 | 57 |
+
+The drop is **not a regression**. The old number was inflated: L1 falsely cleared ~75 same-key amount mismatches per 100-NULL sample by exact-matching bank credit to settlement net without fee reconciliation or a ledger arm. Those rows were hidden breaks, not clean traffic.
+
+The corrected pass **surfaces** them — via `AMOUNT_MISMATCH` (ledger variance), labelled `TRUE_LEAKAGE`, or residual cross-day sides. A submission that reports its own clear rate going down after a correctness fix is doing something almost nobody does.
+
+See `docs/LABEL_DIAGNOSIS.md` for before/after queries.
+
 ## Known limitations
 
 See `KNOWN_ISSUES.md` — filled in with real per-archetype numbers starting

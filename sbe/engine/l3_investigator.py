@@ -22,6 +22,7 @@ from typing import Any, Callable, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from sbe import config
+from sbe.engine.quota import QuotaExhaustedError, quota_exhausted_from_error
 from sbe.engine.tools import decimal_calc
 from sbe.engine.tools.banking_calendar import (
     is_settlement_day,
@@ -138,6 +139,47 @@ def _break_window(break_record: dict) -> tuple[date, date]:
     center = date.fromisoformat(str(raw)[:10])
     # Tight window keeps Groq free-tier TPM under the 8k request cap
     return center - timedelta(days=3), center + timedelta(days=2)
+
+
+def _related_rows_for_break(
+    rec: dict,
+    store: SourceStore,
+    start: date,
+    end: date,
+) -> dict[str, list[dict]]:
+    """Pre-load source rows for the break; fall back to match_key / amount for bank-only."""
+    from sbe.engine.l1_deterministic import hash_join_key
+    from sbe.engine.tools.normalise_identifier import normalise
+
+    mid = rec["merchant_id"]
+    related = {
+        "settlement_report": query_settlement(mid, (start, end), store),
+        "bank_statement": query_bank(mid, (start, end), store),
+        "merchant_ledger": query_ledger(mid, (start, end), store),
+    }
+    if related["bank_statement"]:
+        return related
+
+    mk = normalise(rec.get("match_key") or "")
+    target_amt = abs(money(rec.get("amount_delta") or 0))
+    for row in store.bank:
+        row_copy = dict(row)
+        d_raw = row_copy.get("posting_date") or row_copy.get("value_date")
+        if not d_raw:
+            continue
+        d = date.fromisoformat(str(d_raw)[:10])
+        if d < start or d > end:
+            continue
+        bkey = hash_join_key({**row_copy, "_source": "bank_statement"})
+        if mk and bkey == mk:
+            row_copy.setdefault("merchant_id", mid)
+            related["bank_statement"].append(row_copy)
+            continue
+        if rec.get("side") == "BANK_ONLY" and row_copy.get("debit"):
+            if money(row_copy["debit"]) == target_amt:
+                row_copy.setdefault("merchant_id", mid)
+                related["bank_statement"].append(row_copy)
+    return related
 
 
 def _untrusted_blob(break_record: dict) -> str:
@@ -331,7 +373,7 @@ def _tool_schemas() -> list[dict]:
                         },
                         "expr": {"type": "string"},
                     },
-                    "required": ["op"],
+                    "required": [],
                 },
             },
         },
@@ -511,7 +553,18 @@ def build_tool_dispatcher(
             }
 
         if name == "decimal_calc":
-            op = args["op"]
+            op = args.get("op")
+            if not op:
+                if "claimed_gap" in args:
+                    op = "residual"
+                elif args.get("expr"):
+                    op = "calc"
+                elif "a" in args and "b" in args:
+                    op = "subtract"
+                elif args.get("values"):
+                    op = "add"
+                else:
+                    raise ValueError("decimal_calc: cannot infer op from arguments")
             if op == "add":
                 return {"result": f"{decimal_calc.add(*(args.get('values') or [])):.2f}"}
             if op == "subtract":
@@ -578,8 +631,11 @@ def _chat_openai_compatible(
             )
             return client.chat.completions.create(**kwargs)
         except RateLimitError as exc:
+            qe = quota_exhausted_from_error(exc)
+            if qe is not None:
+                raise qe from exc
             last_exc = exc
-            time.sleep(1.5 * (attempt + 1))
+            time.sleep(1.5 * (2**attempt))
         except (APIStatusError, BadRequestError) as exc:
             last_exc = exc
             body = getattr(exc, "body", None) or {}
@@ -602,6 +658,52 @@ def _chat_openai_compatible(
     raise last_exc
 
 
+def _primary_unavailable(exc: Exception) -> bool:
+    """True when the primary model/provider cannot serve the request."""
+    if isinstance(exc, QuotaExhaustedError):
+        return True
+    msg = str(exc).lower()
+    if "404" in msg and "model" in msg:
+        return True
+    if "not found" in msg and "model" in msg:
+        return True
+    if "invalid_api_key" in msg or "incorrect api key" in msg:
+        return True
+    return False
+
+
+def _investigator_completion(
+    messages: list[dict],
+    tools: list[dict],
+    *,
+    chat_fn: Callable | None,
+    primary_client,
+    primary_model: str,
+) -> tuple[Any, str, bool]:
+    """Call L3 model; on primary failure optionally switch to configured fallback."""
+    if chat_fn is not None:
+        return chat_fn(messages, tools), primary_model, False
+    try:
+        return (
+            _chat_openai_compatible(primary_client, primary_model, messages, tools),
+            primary_model,
+            False,
+        )
+    except Exception as exc:
+        if not config.INVESTIGATOR_FALLBACK_API_KEY or not _primary_unavailable(exc):
+            raise
+        fb_client, fb_model = _provider_client(
+            config.INVESTIGATOR_FALLBACK_PROVIDER,
+            config.INVESTIGATOR_FALLBACK_API_KEY,
+            config.INVESTIGATOR_FALLBACK_MODEL,
+        )
+        return (
+            _chat_openai_compatible(fb_client, fb_model, messages, tools),
+            fb_model,
+            True,
+        )
+
+
 def investigate(
     break_record: dict,
     tools: dict | None = None,
@@ -610,6 +712,7 @@ def investigate(
     conn: sqlite3.Connection | None = None,
     max_turns: int = 10,
     chat_fn: Callable | None = None,
+    primary_model_override: str | None = None,
 ) -> InvestigatorVerdict:
     """Run the investigator tool loop for one break.
 
@@ -635,14 +738,15 @@ def investigate(
         chat_fn = tools["chat_fn"]
 
     client = None
-    model = config.INVESTIGATOR_MODEL
+    model = primary_model_override or config.INVESTIGATOR_MODEL
+    used_fallback = False
     if chat_fn is None:
         if not config.INVESTIGATOR_API_KEY:
             raise RuntimeError("INVESTIGATOR_API_KEY missing — cannot call L3")
         client, model = _provider_client(
             config.INVESTIGATOR_PROVIDER,
             config.INVESTIGATOR_API_KEY,
-            config.INVESTIGATOR_MODEL,
+            model,
         )
         if isinstance(client, tuple) and client[0] == "anthropic":
             raise NotImplementedError(
@@ -652,10 +756,14 @@ def investigate(
     verdict: InvestigatorVerdict | None = None
 
     for _ in range(max_turns):
-        if chat_fn is not None:
-            response = chat_fn(messages, schemas)
-        else:
-            response = _chat_openai_compatible(client, model, messages, schemas)
+        response, model, turn_fallback = _investigator_completion(
+            messages,
+            schemas,
+            chat_fn=chat_fn,
+            primary_client=client,
+            primary_model=model,
+        )
+        used_fallback = used_fallback or turn_fallback
 
         message = response.choices[0].message
         tool_calls = getattr(message, "tool_calls", None) or []
@@ -780,12 +888,18 @@ def investigate(
         )
 
     if conn is not None:
-        _persist_verdict(conn, verdict)
+        _persist_verdict(conn, verdict, model=model, used_fallback=used_fallback)
 
     return verdict
 
 
-def _persist_verdict(conn: sqlite3.Connection, verdict: InvestigatorVerdict) -> None:
+def _persist_verdict(
+    conn: sqlite3.Connection,
+    verdict: InvestigatorVerdict,
+    *,
+    model: str | None = None,
+    used_fallback: bool = False,
+) -> None:
     from sbe.engine.l2_break_ledger import append_audit
 
     prior = conn.execute(
@@ -822,6 +936,22 @@ def _persist_verdict(conn: sqlite3.Connection, verdict: InvestigatorVerdict) -> 
         verdict.verdict,
         at=datetime.utcnow().isoformat(),
     )
+    if model:
+        append_audit(
+            conn,
+            verdict.break_id,
+            "l3_investigator",
+            "provider",
+            config.INVESTIGATOR_MODEL,
+            json.dumps(
+                {
+                    "model": model,
+                    "fallback": used_fallback,
+                    "primary_provider": config.INVESTIGATOR_PROVIDER,
+                }
+            ),
+            at=datetime.utcnow().isoformat(),
+        )
     conn.commit()
 
 
@@ -831,15 +961,15 @@ def investigate_open_breaks(
     seed: str,
     limit: int | None = None,
     store: SourceStore | None = None,
+    smoke: bool = False,
+    subsample: bool = False,
+    primary_model_override: str | None = None,
 ) -> tuple[list[InvestigatorVerdict], "InvestigateRunReport"]:
     """Investigate OPEN breaks for a seed (investigator-alone, no verifier).
 
-    L2-resolved breaks (late_arrival, materiality) are never selected — only
-    status=OPEN rows with no prior L3 verdict. Selection stratifies across
-    archetypes when ``limit`` is set (see ``select_open_breaks_stratified``).
-
-    Returns ``(verdicts, report)`` — check ``report.pass1_core_complete`` in
-    logs before trusting the per-archetype table for Gate 5.
+    ``smoke=True`` selects exactly one break per ``SMOKE_ARCHETYPE_ORDER``
+    (core trio + ADVERSARIAL_NARRATION + SPLIT_SETTLEMENT). Otherwise stratified
+    selection applies when ``limit`` is set.
     """
     import time
 
@@ -847,11 +977,18 @@ def investigate_open_breaks(
     from sbe.scoring.harness import (
         InvestigateRunReport,
         join_breaks_to_ground_truth,
+        select_open_breaks_quota_subsample,
+        select_open_breaks_smoke,
         select_open_breaks_stratified,
     )
 
     source_store = store or SourceStore.load(seed)
-    plan = select_open_breaks_stratified(conn, seed, limit=limit)
+    if smoke:
+        plan = select_open_breaks_smoke(conn, seed)
+    elif subsample:
+        plan = select_open_breaks_quota_subsample(conn, seed, total_cap=limit or 50)
+    else:
+        plan = select_open_breaks_stratified(conn, seed, limit=limit)
     report = InvestigateRunReport(plan=plan)
     if not plan.break_ids:
         return [], report
@@ -892,11 +1029,7 @@ def investigate_open_breaks(
             continue
         start, end = _break_window(rec)
         mid = rec["merchant_id"]
-        related = {
-            "settlement_report": query_settlement(mid, (start, end), source_store),
-            "bank_statement": query_bank(mid, (start, end), source_store),
-            "merchant_ledger": query_ledger(mid, (start, end), source_store),
-        }
+        related = _related_rows_for_break(rec, source_store, start, end)
         if related["bank_statement"]:
             rec["narration"] = related["bank_statement"][0].get("narration", "")
         if related["merchant_ledger"]:
@@ -905,9 +1038,41 @@ def investigate_open_breaks(
         if meta.get(break_id, {}).get("archetype"):
             rec["_archetype_hint"] = meta[break_id]["archetype"]
         try:
-            out.append(investigate(rec, store=source_store, conn=conn))
+            out.append(
+                investigate(
+                    rec,
+                    store=source_store,
+                    conn=conn,
+                    primary_model_override=primary_model_override,
+                )
+            )
             report.succeeded.append(break_id)
+        except QuotaExhaustedError as exc:
+            report.failed.append((break_id, f"QuotaExhausted: {exc.reset_hint or exc}"))
+            report.quota_exhausted = True
+            report.quota_reset_hint = exc.reset_hint
+            import warnings
+
+            warnings.warn(
+                f"L3 quota exhausted at {break_id} "
+                f"(reset ~{exc.reset_hint or 'unknown'}); "
+                f"{len(report.succeeded)} verdict(s) already checkpointed"
+            )
+            break
         except Exception as exc:
+            qe = quota_exhausted_from_error(exc)
+            if qe is not None:
+                report.failed.append((break_id, f"QuotaExhausted: {qe.reset_hint or qe}"))
+                report.quota_exhausted = True
+                report.quota_reset_hint = qe.reset_hint
+                import warnings
+
+                warnings.warn(
+                    f"L3 quota exhausted at {break_id} "
+                    f"(reset ~{qe.reset_hint or 'unknown'}); "
+                    f"{len(report.succeeded)} verdict(s) already checkpointed"
+                )
+                break
             report.failed.append((break_id, f"{type(exc).__name__}: {exc}"))
             import warnings
 

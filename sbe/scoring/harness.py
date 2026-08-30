@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass, field
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,7 @@ import pandas as pd
 from sbe.engine.tools.normalise_identifier import normalise
 from sbe.engine.tools.query_sources import SourceStore
 from sbe.generator.seed import SEEDS_ROOT
-from sbe.money import money
+from sbe.money import ZERO, money
 
 # GATE 5 — arithmetic-heavy archetypes the investigator must be measured on.
 GATE5_ARITHMETIC_ARCHETYPES: tuple[str, ...] = (
@@ -42,6 +43,25 @@ GATE5_CORE_ARITHMETIC: tuple[str, ...] = (
     "TDS_194O",
     "CHARGEBACK_PLUS_FEE",
 )
+
+# Named smoke slice — one OPEN break per archetype (Gate 5 trio + trust + arithmetic).
+SMOKE_ARCHETYPE_ORDER: tuple[str, ...] = (
+    *GATE5_CORE_ARITHMETIC,
+    "ADVERSARIAL_NARRATION",
+    "SPLIT_SETTLEMENT",
+)
+
+# Quota subsample — fixed n per archetype (~35 dev run). TDS/CHARGEBACK weighted.
+QUOTA_SUBSAMPLE_PLAN: dict[str, int] = {
+    "TDS_194O": 12,
+    "CHARGEBACK_PLUS_FEE": 12,
+    "TRUE_LEAKAGE": 6,
+    "FEE_PLUS_GST": 3,
+    "ADVERSARIAL_NARRATION": 2,
+    "INSTANT_SETTLEMENT_FEE": 2,
+    "REFUND_NETTED": 2,
+    "SPLIT_SETTLEMENT": 2,
+}
 
 # L2 closes these deterministically — never score as L3 verdicts (BUILD_PLAN Phase 2).
 L2_CLOSE_REASONS: frozenset[str] = frozenset({"late_arrival", "materiality"})
@@ -69,6 +89,8 @@ class InvestigateRunReport:
     plan: StratifiedSelectionPlan
     succeeded: list[str] = field(default_factory=list)
     failed: list[tuple[str, str]] = field(default_factory=list)  # break_id, error
+    quota_exhausted: bool = False
+    quota_reset_hint: str | None = None
 
     def pass1_core_status(self) -> dict[str, Pass1Status]:
         """Per core-archetype status after this run (for log / Gate 5 gating)."""
@@ -119,6 +141,119 @@ def is_l3_scored_break(row: dict, l3_ids: set[str]) -> bool:
     if row.get("close_reason") in L2_CLOSE_REASONS:
         return False
     return row.get("verdict") is not None
+
+
+def l3_verdict_map(conn: sqlite3.Connection, seed: str) -> dict[str, str]:
+    """Latest L3 verdict per break from audit_log (pre-verifier ground truth)."""
+    rows = conn.execute(
+        """
+        SELECT a.break_id, a.new_value
+          FROM audit_log a
+          JOIN (
+                SELECT break_id, MAX(audit_id) AS audit_id
+                  FROM audit_log
+                 WHERE who = 'l3_investigator' AND what = 'verdict'
+                 GROUP BY break_id
+               ) latest ON latest.audit_id = a.audit_id
+          JOIN breaks b ON b.break_id = a.break_id
+         WHERE b.seed = ?
+        """,
+        (seed,),
+    ).fetchall()
+    return {bid: verdict for bid, verdict in rows if verdict}
+
+
+def post_verifier_verdict(row: dict, l3_verdict: str | None) -> str | None:
+    """Effective verdict after L4 — OVERTURN updates breaks.verdict; else L3 stands."""
+    dec = row.get("verifier_decision")
+    if dec is None:
+        return l3_verdict or row.get("verdict")
+    if dec == "OVERTURN":
+        return row.get("verdict")
+    return l3_verdict or row.get("verdict")
+
+
+def select_open_breaks_smoke(
+    conn: sqlite3.Connection, seed: str
+) -> StratifiedSelectionPlan:
+    """Deterministic smoke: one OPEN break per ``SMOKE_ARCHETYPE_ORDER`` (max 5)."""
+    joined = join_breaks_to_ground_truth(conn, seed)
+    eligible = [
+        r
+        for r in joined
+        if r.get("status") == "OPEN"
+        and r.get("verdict") is None
+        and r.get("close_reason") not in L2_CLOSE_REASONS
+    ]
+    by_arch: dict[str, list[dict]] = {}
+    for r in eligible:
+        by_arch.setdefault(r.get("archetype") or "UNKNOWN", []).append(r)
+    for arch in by_arch:
+        by_arch[arch].sort(key=lambda r: (str(r["first_seen_run"]), r["break_id"]))
+
+    picked: list[str] = []
+    pass1_selected: dict[str, str | None] = {}
+    for arch in SMOKE_ARCHETYPE_ORDER:
+        bucket = by_arch.get(arch) or []
+        if bucket:
+            bid = bucket[0]["break_id"]
+            picked.append(bid)
+            pass1_selected[arch] = bid
+        elif arch in GATE5_CORE_ARITHMETIC:
+            pass1_selected[arch] = None
+
+    return StratifiedSelectionPlan(
+        break_ids=picked,
+        pass1_selected=pass1_selected,
+        pass1_cap_truncated=[],
+        eligible_archetypes=set(by_arch.keys()),
+    )
+
+
+def select_open_breaks_quota_subsample(
+    conn: sqlite3.Connection, seed: str, *, total_cap: int = 50
+) -> StratifiedSelectionPlan:
+    """Fixed n per archetype for quota-bound scoring (not random draw).
+
+    Oversamples core trio + TRUE_LEAKAGE; fills remainder up to ``total_cap``.
+    Skips archetypes with no eligible OPEN rows.
+    """
+    joined = join_breaks_to_ground_truth(conn, seed)
+    eligible = [
+        r
+        for r in joined
+        if r.get("status") == "OPEN"
+        and r.get("verdict") is None
+        and r.get("close_reason") not in L2_CLOSE_REASONS
+    ]
+    by_arch: dict[str, list[dict]] = {}
+    for r in eligible:
+        by_arch.setdefault(r.get("archetype") or "UNKNOWN", []).append(r)
+    for arch in by_arch:
+        by_arch[arch].sort(key=lambda r: (str(r["first_seen_run"]), r["break_id"]))
+
+    picked: list[str] = []
+    pass1_selected: dict[str, str | None] = {
+        a: None for a in GATE5_CORE_ARITHMETIC
+    }
+    for arch, n in QUOTA_SUBSAMPLE_PLAN.items():
+        if len(picked) >= total_cap:
+            break
+        bucket = by_arch.get(arch) or []
+        for row in bucket[:n]:
+            if len(picked) >= total_cap:
+                break
+            if row["break_id"] not in picked:
+                picked.append(row["break_id"])
+                if arch in pass1_selected:
+                    pass1_selected[arch] = row["break_id"]
+
+    return StratifiedSelectionPlan(
+        break_ids=picked,
+        pass1_selected=pass1_selected,
+        pass1_cap_truncated=[],
+        eligible_archetypes=set(by_arch.keys()),
+    )
 
 
 def select_open_breaks_stratified(
@@ -211,7 +346,11 @@ def format_pass1_report(report: InvestigateRunReport) -> str:
     st = report.pass1_core_status()
     parts = [f"{arch}={st[arch]}" for arch in GATE5_CORE_ARITHMETIC]
     flag = "COMPLETE" if report.pass1_core_complete else "INCOMPLETE"
-    return f"GATE5 pass1 core [{flag}]: " + ", ".join(parts)
+    line = f"GATE5 pass1 core [{flag}]: " + ", ".join(parts)
+    if report.quota_exhausted:
+        hint = report.quota_reset_hint or "unknown"
+        line += f" | QUOTA_EXHAUSTED reset~{hint}"
+    return line
 
 
 def select_open_breaks_stratified_ids(
@@ -238,6 +377,9 @@ def build_match_key_index(
     seed: str, store: SourceStore | None = None
 ) -> dict[str, dict[str, Any]]:
     """Map normalised UTR/match_key → ground_truth row (scoring-only)."""
+    from sbe.engine.l1_deterministic import _ledger_net, _row_amount, hash_join_key
+    from sbe.generator.archetypes._helpers import amount_delta
+
     source = store or SourceStore.load(seed)
     index: dict[str, dict[str, Any]] = {}
 
@@ -245,14 +387,37 @@ def build_match_key_index(
         if not key:
             return
         canon = normalise(key)
-        if canon:
+        if canon and canon not in index:
             index[canon] = gt
+
+    def _ledger_for_gross(gross: Decimal, merchant: str, od: str) -> list[dict]:
+        hits: list[dict] = []
+        seen: set[str] = set()
+        for lrow in source.ledger:
+            if lrow.get("entry_type") != "sale":
+                continue
+            if money(lrow.get("amount") or 0) != gross:
+                continue
+            oid = lrow.get("order_id") or ""
+            if not oid or oid in seen:
+                continue
+            seen.add(oid)
+            hits.append(
+                [r for r in source.ledger if r.get("order_id") == oid]
+            )
+        return hits[0] if len(hits) == 1 else []
 
     for gt in load_ground_truth(seed):
         if gt.get("utr"):
             _add(gt["utr"], gt)
         if gt.get("full_utr"):
             _add(gt["full_utr"], gt)
+            for b in source.bank:
+                bkey = hash_join_key({**b, "_source": "bank_statement"})
+                if bkey and normalise(gt["full_utr"]).startswith(bkey):
+                    _add(bkey, gt)
+        if gt.get("shared_utr"):
+            _add(gt["shared_utr"], gt)
         mid = gt.get("merchant_id")
         od = str(gt.get("open_date", ""))[:10]
         gross = gt.get("gross_amount")
@@ -276,6 +441,51 @@ def build_match_key_index(
                     continue
                 _add(s.get("utr"), gt)
                 break
+
+        if gt.get("utr") or not mid or not od:
+            continue
+        declared = money(gt.get("amount_delta", 0))
+        if declared == ZERO and gt.get("archetype") not in {"TRUE_LEAKAGE"}:
+            continue
+        for s in source.settlement:
+            if s.get("merchant_id") != mid:
+                continue
+            if str(s.get("settled_at", ""))[:10] != od:
+                continue
+            utr = normalise(s.get("utr") or "")
+            if not utr or utr in index:
+                continue
+            bank_rows = [
+                b
+                for b in source.bank
+                if hash_join_key({**b, "_source": "bank_statement"}) == utr
+            ]
+            if not bank_rows:
+                continue
+            gross_amt = money(s.get("gross_amount") or 0)
+            ledger_rows = _ledger_for_gross(gross_amt, mid, od)
+            if not ledger_rows:
+                continue
+            implied = amount_delta(bank_rows, ledger_rows)
+            if implied == declared:
+                _add(s.get("utr"), gt)
+                continue
+            # TRUE_LEAKAGE: bank credit short vs settlement net
+            bank_amt = _row_amount(bank_rows[0])
+            sett_amt = money(s.get("net_amount") or 0)
+            if money(bank_amt - sett_amt) == declared:
+                _add(s.get("utr"), gt)
+
+        # Bank-only rows (chargeback debit, etc.)
+        if gt.get("archetype") == "CHARGEBACK_PLUS_FEE" and mid and od:
+            target = abs(money(gt.get("amount_delta", 0)))
+            for b in source.bank:
+                if not b.get("debit"):
+                    continue
+                if money(b.get("debit") or 0) != target:
+                    continue
+                bkey = hash_join_key({**b, "_source": "bank_statement"})
+                _add(bkey, gt)
     return index
 
 
@@ -353,6 +563,7 @@ def per_archetype_table(conn: sqlite3.Connection, seed: str) -> pd.DataFrame:
     closes are excluded (they never tested investigative capability).
     """
     l3_ids = l3_investigated_break_ids(conn, seed)
+    l3_verdicts = l3_verdict_map(conn, seed)
     rows = join_breaks_to_ground_truth(conn, seed)
     scored = [r for r in rows if is_l3_scored_break(r, l3_ids)]
     if not scored:
@@ -375,14 +586,21 @@ def per_archetype_table(conn: sqlite3.Connection, seed: str) -> pd.DataFrame:
     for archetype in sorted(by_arch.keys()):
         group = by_arch[archetype]
         n = len(group)
-        correct = sum(1 for g in group if g["correct"])
-        acc = (100.0 * correct / n) if n else 0.0
-        # Verifier not wired yet — placeholder until L4 (Day 7).
-        lifts = []
-        for g in group:
-            if g.get("verifier_decision") == "OVERTURN":
-                lifts.append(1)  # stub: real lift computed post-verifier
-        verifier_lift = 0.0
+        labeled = [g for g in group if g.get("correct_verdict")]
+        pre_ok = 0
+        post_ok = 0
+        for g in labeled:
+            l3v = l3_verdicts.get(g["break_id"]) or g.get("verdict")
+            post = post_verifier_verdict(g, l3v)
+            cv = g["correct_verdict"]
+            if l3v == cv:
+                pre_ok += 1
+            if post == cv:
+                post_ok += 1
+        correct = pre_ok
+        acc = (100.0 * pre_ok / len(labeled)) if labeled else 0.0
+        post_acc = (100.0 * post_ok / len(labeled)) if labeled else acc
+        verifier_lift = post_acc - acc
         table_rows.append(
             {
                 "archetype": archetype,
@@ -433,9 +651,44 @@ def leakage_recall(conn: sqlite3.Connection, seed: str) -> float:
 
 
 def net_accuracy_lift(conn: sqlite3.Connection, seed: str) -> tuple[float, float]:
-    """Returns (net_lift, false_overturn_rate). Placeholder until L4."""
-    del conn, seed
-    return (0.0, 0.0)
+    """Returns (net_lift_pp, false_overturn_rate_pct) for L3-scored labeled breaks.
+
+    net_lift_pp — post-verifier accuracy minus investigator-alone accuracy.
+    false_overturn_rate_pct — among OVERTURN decisions, share that broke a
+    correct L3 call (ARCHITECTURE §7.3; not raw overturn rate).
+    """
+    l3_ids = l3_investigated_break_ids(conn, seed)
+    l3_verdicts = l3_verdict_map(conn, seed)
+    rows = join_breaks_to_ground_truth(conn, seed)
+    scored = [
+        r
+        for r in rows
+        if is_l3_scored_break(r, l3_ids) and r.get("correct_verdict")
+    ]
+    if not scored:
+        return (float("nan"), float("nan"))
+
+    pre_ok = post_ok = 0
+    overturns: list[tuple[str, str]] = []
+    for r in scored:
+        l3v = l3_verdicts.get(r["break_id"]) or r.get("verdict")
+        post = post_verifier_verdict(r, l3v)
+        cv = r["correct_verdict"]
+        if l3v == cv:
+            pre_ok += 1
+        if post == cv:
+            post_ok += 1
+        if r.get("verifier_decision") == "OVERTURN" and l3v is not None:
+            overturns.append((l3v, cv))
+
+    n = len(scored)
+    net_lift_pp = (post_ok - pre_ok) / n * 100.0
+    if not overturns:
+        false_overturn_rate = float("nan")
+    else:
+        false_overturns = sum(1 for l3v, cv in overturns if l3v == cv)
+        false_overturn_rate = false_overturns / len(overturns) * 100.0
+    return (net_lift_pp, false_overturn_rate)
 
 
 def match_residual_violations(conn: sqlite3.Connection, seed: str) -> list[str]:

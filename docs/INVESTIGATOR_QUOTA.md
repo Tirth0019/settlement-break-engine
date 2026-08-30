@@ -80,3 +80,79 @@ Report separately in `sbe score`:
 
 A high resist rate with low correct rate means trust boundary held but the
 model is over-cautious on fee-arithmetic archetypes — not a safety failure.
+
+## Named smoke slice (`--smoke`)
+
+Before any full run:
+
+```bash
+sbe budget --seed 1001          # tokens vs TPD
+sbe investigate --seed 1001 --smoke
+```
+
+`--smoke` selects **one OPEN break per** `SMOKE_ARCHETYPE_ORDER` (max 5):
+
+`FEE_PLUS_GST`, `TDS_194O`, `CHARGEBACK_PLUS_FEE`, `ADVERSARIAL_NARRATION`,
+`SPLIT_SETTLEMENT`.
+
+Unlike `--limit 5`, this is deterministic for Gate 5 wiring validation.
+
+## Token budget (`sbe budget`)
+
+Compares `open_eligible × L3_TOKENS_PER_BREAK` (default 4000) against
+`GROQ_TPD_LIMIT` (default 200000). If the full set does not fit one TPD window,
+use a stratified cap (~50 breaks/day on free tier) and report per-archetype n
+as a subsample — do not launch a run that will die at 60%.
+
+Env overrides: `L3_TOKENS_PER_BREAK`, `GROQ_TPD_LIMIT`.
+
+**Seed 2001 (Aug 30 check):** 192 OPEN eligible × ~4k ≈ **768k tok** — does not fit
+200k TPD. Max **~50 breaks/day**. Smoke pool on 2001: `FEE_PLUS_GST=20`, `TDS_194O=14`,
+`CHARGEBACK_PLUS_FEE=8`, `ADVERSARIAL_NARRATION=7`. Full 172 labelled pool requires
+stratified subsample; report per-archetype n.
+
+## Freeze-window L3 schedule (Aug 31 – Sep 2)
+
+~**100 dev L3 calls** left; **~100 reserved for hold-out**. Three calendar days of
+quota ≈ **150 calls max** at 50/day — not enough for 172 + hold-out full pools.
+
+| Day | Plan |
+|---|---|
+| **Aug 31** | `sbe budget --seed 2001` → `sbe investigate --seed 2001 --smoke` (5 breaks, **hand-read all verdicts**) → if clean, `--subsample` ~50 (core trio + `TRUE_LEAKAGE` weighted) → `sbe verify` → `sbe score` |
+| **Sep 1** | Second ~50 subsample if Aug 31 clean, else freeze |
+| **Sep 2** | Hold-out seed: generate at a size where ~50 stratified covers a meaningful fraction (not 280-record dense scale) |
+
+Ten correct out of ten on `FEE_PLUS_GST` with honest n beats an unscored core trio.
+
+## TPD fail-fast
+
+On daily quota exhaustion (429 + "tokens per day"), L3 **stops immediately**.
+Verdicts already written per break remain checkpointed. Log shows
+`QUOTA_EXHAUSTED reset~…`.
+
+## L3 fallback provider
+
+Optional second family when primary is unavailable (TPD, dead model ID):
+
+```env
+INVESTIGATOR_FALLBACK_PROVIDER=google
+INVESTIGATOR_FALLBACK_MODEL=gemini-3.6-flash
+INVESTIGATOR_FALLBACK_API_KEY=...
+```
+
+Fallback runs are flagged in `audit_log` (`what=provider`, `"fallback": true`).
+
+Verify wiring (requires fallback env set):
+
+```bash
+sbe investigate --seed 1001 --test-fallback --limit 1
+```
+
+Forces a dead primary model ID; must succeed via fallback and write the audit flag.
+
+## L4 verifier quota (locked Aug 30)
+
+**Separate provider, not Groq pacing:** L4 stays on **Google** (`VERIFIER_MODEL=gemini-3.6-flash`)
+with its own API quota — do not share `INVESTIGATE_PACE_SECONDS` / Groq TPD with L3; budget
+~1 verifier call per L3 verdict (~1k tokens/call) against Google free/paid limits instead.
+

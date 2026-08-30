@@ -15,11 +15,11 @@ app = typer.Typer(help="Settlement Break Engine")
 
 
 @app.command()
-def generate(seed: str = "1001", days: int = 10):
-    """Generate a synthetic seed (ROADMAP.md Day 1-2)."""
+def generate(seed: str = "1001", days: int = 10, dense: bool = False):
+    """Generate a synthetic seed (ROADMAP.md Day 1-2). Use --dense for scoring pool (~450 rows)."""
     from sbe.generator.seed import generate_seed
 
-    out = generate_seed(seed=seed, days=days)
+    out = generate_seed(seed=seed, days=days, dense=dense)
     rprint(f"[green]Generated seed {seed} -> {out}[/green]")
 
 
@@ -87,7 +87,22 @@ def run(seed: str = "1001", date: str = None):
 @app.command()
 def investigate(
     seed: str = "1001",
-    limit: int = typer.Option(None, help="Max OPEN breaks to investigate"),
+    limit: int = typer.Option(None, help="Max OPEN breaks (ignored when --smoke)"),
+    smoke: bool = typer.Option(
+        False,
+        "--smoke",
+        help="Named smoke slice: one break each from core trio + ADVERSARIAL + SPLIT",
+    ),
+    subsample: bool = typer.Option(
+        False,
+        "--subsample",
+        help="Quota stratified subsample (fixed n per archetype, default cap 50)",
+    ),
+    test_fallback: bool = typer.Option(
+        False,
+        "--test-fallback",
+        help="Force dead primary model ID to verify INVESTIGATOR_FALLBACK_* wiring",
+    ),
     through_day: int = typer.Option(
         None, "--through-day", help="Run L1+L2+L5 through this day first"
     ),
@@ -113,12 +128,49 @@ def investigate(
     ).fetchone()[0] == 0:
         run_seed(conn, seed=seed)
 
+    primary_override = "__dead_primary_for_fallback_test__" if test_fallback else None
+    if test_fallback:
+        from sbe import config
+
+        if not config.INVESTIGATOR_FALLBACK_API_KEY:
+            raise typer.BadParameter(
+                "INVESTIGATOR_FALLBACK_* must be set for --test-fallback"
+            )
+        rprint("[cyan]test-fallback[/cyan] primary model forced dead; expect fallback")
+
     verdicts, report = investigate_open_breaks(
-        conn, seed=seed, limit=limit if limit is not None else INVESTIGATE_PER_RUN_CAP
+        conn,
+        seed=seed,
+        limit=None if smoke else (limit if limit is not None else INVESTIGATE_PER_RUN_CAP),
+        smoke=smoke,
+        subsample=subsample,
+        primary_model_override=primary_override,
     )
     from sbe.scoring.harness import format_pass1_report
 
     rprint(format_pass1_report(report))
+    if report.quota_exhausted:
+        rprint(
+            f"[red]quota exhausted[/red] — {len(verdicts)} verdict(s) checkpointed; "
+            f"reset ~{report.quota_reset_hint or 'unknown'}. "
+            "Smoke with `--smoke` before full runs."
+        )
+    if test_fallback and verdicts:
+        bid = verdicts[0].break_id
+        prov = conn.execute(
+            """
+            SELECT new_value FROM audit_log
+             WHERE break_id=? AND who='l3_investigator' AND what='provider'
+             ORDER BY audit_id DESC LIMIT 1
+            """,
+            (bid,),
+        ).fetchone()
+        if not prov or '"fallback": true' not in (prov[0] or "").replace(" ", ""):
+            conn.close()
+            raise SystemExit(
+                f"--test-fallback failed: no fallback=true in audit_log for {bid}"
+            )
+        rprint(f"[green]fallback OK[/green] audit_log provider={prov[0][:120]}")
     conn.close()
 
     if not verdicts:
@@ -167,6 +219,7 @@ def score(
         gate5_archetype_coverage,
         leakage_recall,
         match_residual_violations,
+        net_accuracy_lift,
         per_archetype_table,
         value_weighted_reconciled_pct,
     )
@@ -208,6 +261,7 @@ def score(
     bad_match = match_residual_violations(conn, seed)
     adv = adversarial_metrics(conn, seed)
     g5 = gate5_archetype_coverage(conn, seed)
+    net_lift, false_overturn = net_accuracy_lift(conn, seed)
     conn.close()
 
     if bad_match:
@@ -242,10 +296,15 @@ def score(
         )
 
     leak_str = f"{leak:.1f}%" if leak == leak else "n/a"
+    lift_str = f"{net_lift:+.1f}pp" if net_lift == net_lift else "n/a"
+    overturn_str = (
+        f"{false_overturn:.1f}%" if false_overturn == false_overturn else "n/a"
+    )
     rprint(
         f"[green]score OK[/green] seed={seed} "
         f"l3_archetypes={len(table)} value_weighted_match={vw:.1f}% "
-        f"leakage_recall={leak_str}"
+        f"leakage_recall={leak_str} net_verifier_lift={lift_str} "
+        f"false_overturn_rate={overturn_str}"
     )
 
     if adv["n"]:
@@ -269,9 +328,97 @@ def score(
 
 
 @app.command()
+def verify(
+    seed: str = "1001",
+    limit: int = typer.Option(
+        None,
+        "--limit",
+        help="Cap L4 verifier calls (default: all L3-verdicted breaks without L4).",
+    ),
+):
+    """Run L4 verifier on investigator verdicts (GATE 6)."""
+    from sbe.config import DB_PATH
+    from sbe.db.connection import get_connection
+    from sbe.engine.l4_verifier import verify_l3_breaks
+    from sbe.generator.seed import SEEDS_ROOT
+    from sbe.scoring.harness import l3_investigated_break_ids, net_accuracy_lift
+
+    if not (SEEDS_ROOT / seed / "manifest.json").exists():
+        raise typer.BadParameter(f"seed {seed} missing — run sbe generate first")
+
+    db_path = Path(DB_PATH).parent / f"sbe_{seed}.db"
+    if not db_path.exists():
+        raise typer.BadParameter(
+            f"no db for seed {seed} — run `sbe run --seed {seed}` first"
+        )
+
+    conn = get_connection(str(db_path))
+    l3_n = len(l3_investigated_break_ids(conn, seed))
+    if l3_n == 0:
+        rprint("[yellow]no L3 investigator verdicts — run sbe investigate or sbe score[/yellow]")
+        conn.close()
+        return
+
+    pending = conn.execute(
+        """
+        SELECT COUNT(*) FROM breaks
+         WHERE seed = ? AND break_id IN (
+               SELECT break_id FROM audit_log
+                WHERE who = 'l3_investigator' AND what = 'verdict'
+             )
+           AND verifier_decision IS NULL
+        """,
+        (seed,),
+    ).fetchone()[0]
+    rprint(
+        f"[cyan]verifying[/cyan] up to {limit or pending} of {pending} pending "
+        f"({l3_n} L3 total)…"
+    )
+    decisions = verify_l3_breaks(conn, seed=seed, limit=limit)
+    net_lift, false_overturn = net_accuracy_lift(conn, seed)
+    conn.close()
+
+    uphold = sum(1 for d in decisions if d.decision == "UPHOLD")
+    overturn = sum(1 for d in decisions if d.decision == "OVERTURN")
+    escalate = sum(1 for d in decisions if d.decision == "ESCALATE")
+    lift_str = f"{net_lift:+.1f}pp" if net_lift == net_lift else "n/a"
+    overturn_str = (
+        f"{false_overturn:.1f}%" if false_overturn == false_overturn else "n/a"
+    )
+    rprint(
+        f"[green]verify OK[/green] seed={seed} ran={len(decisions)} "
+        f"uphold={uphold} overturn={overturn} escalate={escalate} "
+        f"net_lift={lift_str} false_overturn_rate={overturn_str}"
+    )
+
+
+@app.command()
+def budget(seed: str = "1001"):
+    """Estimate L3 token budget vs TPD before a full investigate run."""
+    from sbe.config import DB_PATH
+    from sbe.db.connection import get_connection
+    from sbe.generator.seed import SEEDS_ROOT
+    from sbe.scoring.budget import estimate_investigate_budget, format_budget_report
+
+    if not (SEEDS_ROOT / seed / "manifest.json").exists():
+        raise typer.BadParameter(f"seed {seed} missing — run sbe generate first")
+
+    db_path = Path(DB_PATH).parent / f"sbe_{seed}.db"
+    if not db_path.exists():
+        raise typer.BadParameter(f"no db for seed {seed} — run sbe run first")
+
+    conn = get_connection(str(db_path))
+    report = estimate_investigate_budget(conn, seed)
+    conn.close()
+    rprint(format_budget_report(report))
+
+
+@app.command()
 def check(what: str, seed: str = "1001", day: int = None):
-    """Individual daily-check items: rollforward | idempotency | residuals."""
-    if what == "idempotency":
+    """Daily checks: surfacing | rollforward | idempotency | residuals."""
+    if what == "surfacing":
+        _check_surfacing(seed=seed)
+    elif what == "idempotency":
         _check_idempotency(seed=seed, day=day or 1)
     elif what == "rollforward":
         _check_rollforward(seed=seed, day=day)
@@ -279,8 +426,24 @@ def check(what: str, seed: str = "1001", day: int = None):
         _check_residuals(seed=seed)
     else:
         raise typer.BadParameter(
-            f"unknown check {what!r}; expected idempotency|rollforward|residuals"
+            f"unknown check {what!r}; expected surfacing|idempotency|rollforward|residuals"
         )
+
+
+def _check_surfacing(seed: str) -> None:
+    from sbe.config import DB_PATH
+    from sbe.db.connection import get_connection
+    from sbe.engine.l1_surfacing_gate import check_l1_surfacing, format_surfacing_report
+
+    db_path = Path(DB_PATH).parent / f"sbe_{seed}.db"
+    if not db_path.exists():
+        raise typer.BadParameter(f"no db for seed {seed} — run sbe run first")
+    conn = get_connection(str(db_path))
+    result = check_l1_surfacing(conn, seed)
+    conn.close()
+    rprint(format_surfacing_report(result))
+    if not result["ok"]:
+        raise SystemExit("SURFACING GATE FAIL — see docs/LABEL_DIAGNOSIS.md")
 
 
 def _check_idempotency(seed: str, day: int) -> None:

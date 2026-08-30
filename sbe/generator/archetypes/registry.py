@@ -122,3 +122,24 @@ DAY2_MODULES = [
 ]
 
 ALL_MODULES = DAY1_MODULES + DAY2_MODULES
+
+# Dense scoring seed — fewer rows, lower CLEAN share (~120–150 labelled OPEN breaks after L1).
+DENSE_ARCHETYPE_WEIGHTS: list[tuple[str, object, float]] = [
+    ("CLEAN", generate_clean, 0.38),
+    ("FEE_PLUS_GST", fee_plus_gst.generate, 0.08),
+    ("TDS_194O", tds_194o.generate, 0.07),
+    ("CHARGEBACK_PLUS_FEE", chargeback_plus_fee.generate, 0.06),
+    ("REFUND_NETTED", refund_netted.generate, 0.06),
+    ("TRUE_LEAKAGE", true_leakage.generate, 0.10),
+    ("ADVERSARIAL_NARRATION", adversarial_narration.generate, 0.04),
+    ("ROLLING_RESERVE_HOLD", rolling_reserve.generate, 0.05),
+    ("T2_PERIOD_BOUNDARY", t2_period_boundary.generate, 0.05),
+    ("INSTANT_SETTLEMENT_FEE", instant_settlement_fee.generate, 0.05),
+    ("SPLIT_SETTLEMENT", split_settlement.generate, 0.05),
+    ("STATE_HOLIDAY_SHIFT", state_holiday_shift.generate, 0.03),
+    ("BANK_CUTOFF_ROLLOVER", bank_cutoff_rollover.generate, 0.03),
+    ("UTR_TRUNCATION", utr_truncation.generate, 0.03),
+    ("UPI_RRN_VS_UTR", upi_rrn_vs_utr.generate, 0.02),
+    ("DUPLICATE_UTR", duplicate_utr.generate, 0.02),
+    ("FX_ROUNDING_DRIFT", fx_rounding_drift.generate, 0.01),
+]

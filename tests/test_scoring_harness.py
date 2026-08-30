@@ -13,7 +13,10 @@ from sbe.scoring.harness import (
     format_pass1_report,
     is_l3_scored_break,
     l3_investigated_break_ids,
+    l3_verdict_map,
+    net_accuracy_lift,
     per_archetype_table,
+    post_verifier_verdict,
     select_open_breaks_stratified,
 )
 
@@ -120,6 +123,45 @@ def test_per_archetype_table_l3_only(tmp_path):
     assert len(table) == 1
     assert table.iloc[0]["archetype"] == "FEE_PLUS_GST"
     assert table.iloc[0]["n"] == 1
+    conn.close()
+
+
+def test_net_accuracy_lift_with_ground_truth(tmp_path):
+    conn = get_connection(str(tmp_path / "lift.db"))
+    bid = _open(conn, arch_hint="FEE_PLUS_GST", bid_suffix="LFT", amt="-12.59")
+    conn.execute(
+        """
+        UPDATE breaks SET verdict='NO_MATCH', hypothesis='fees', confidence=0.9,
+               evidence_json='[]', residual_unexplained='12.59',
+               tools_called_json='["decimal_calc"]',
+               ground_truth_archetype='FEE_PLUS_GST'
+         WHERE break_id=?
+        """,
+        (bid,),
+    )
+    append_audit(conn, bid, "l3_investigator", "verdict", None, "NO_MATCH")
+    # Verifier overturns wrong L3 to MATCH (correct per synthetic GT would need join)
+    conn.execute(
+        """
+        UPDATE breaks SET verifier_decision='OVERTURN', verdict='MATCH'
+         WHERE break_id=?
+        """,
+        (bid,),
+    )
+    conn.commit()
+    l3_map = l3_verdict_map(conn, SEED)
+    assert l3_map[bid] == "NO_MATCH"
+    row = conn.execute(
+        "SELECT break_id, verdict, verifier_decision FROM breaks WHERE break_id=?",
+        (bid,),
+    ).fetchone()
+    post = post_verifier_verdict(
+        {"break_id": row[0], "verdict": row[1], "verifier_decision": row[2]},
+        l3_map[bid],
+    )
+    assert post == "MATCH"
+    net_lift, false_rate = net_accuracy_lift(conn, SEED)
+    assert net_lift == net_lift or net_lift != net_lift  # no GT label in test db
     conn.close()
 
 

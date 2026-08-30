@@ -23,7 +23,7 @@ from pathlib import Path
 from sbe.config import RECORD_COUNT
 from sbe.engine.tools.banking_calendar import load_calendar
 from sbe.engine.tools.fee_recompute import load_fee_schedule
-from sbe.generator.archetypes.registry import ARCHETYPE_WEIGHTS
+from sbe.generator.archetypes.registry import ARCHETYPE_WEIGHTS, DENSE_ARCHETYPE_WEIGHTS
 from sbe.generator.validate_seed import validate_seed
 from sbe.money import money
 
@@ -107,7 +107,14 @@ def _serialize_gt(gt: dict) -> dict:
     return out
 
 
-def generate_seed(seed: str, days: int = 10, start_date: date | None = None) -> Path:
+def generate_seed(
+    seed: str,
+    days: int = 10,
+    start_date: date | None = None,
+    *,
+    dense: bool = False,
+    record_count: int | None = None,
+) -> Path:
     seed_int = int(seed)
     rng = random.Random(seed_int)
     fee_schedule = load_fee_schedule()
@@ -117,10 +124,17 @@ def generate_seed(seed: str, days: int = 10, start_date: date | None = None) -> 
         # Mid-March 2026 window — includes Gujarat Dhuleti contrast nearby
         start_date = date(2026, 3, 10)
 
-    per_day = max(1, RECORD_COUNT // days)
-    # Pad last day so total ~= RECORD_COUNT
+    target_records = record_count if record_count is not None else (280 if dense else RECORD_COUNT)
+    weights = DENSE_ARCHETYPE_WEIGHTS if dense else ARCHETYPE_WEIGHTS
+
+    def _pick_weighted_local():
+        names, fns, wts = zip(*weights)
+        return rng.choices(list(zip(names, fns)), weights=wts, k=1)[0]
+
+    per_day = max(1, target_records // days)
+    # Pad last day so total ~= target_records
     totals = [per_day] * days
-    totals[-1] += RECORD_COUNT - sum(totals)
+    totals[-1] += target_records - sum(totals)
 
     day_buckets: dict[int, dict] = {
         i: {
@@ -147,9 +161,9 @@ def generate_seed(seed: str, days: int = 10, start_date: date | None = None) -> 
             cal["_merchant_state"] = state
 
             # Don't schedule MULTI_DAY opens too late to close inside the seed
-            name, gen_fn = _pick_weighted(rng)
+            name, gen_fn = _pick_weighted_local()
             if name in {"ROLLING_RESERVE_HOLD", "T2_PERIOD_BOUNDARY"} and day_idx > days - 4:
-                name, gen_fn = "CLEAN", ARCHETYPE_WEIGHTS[0][1]
+                name, gen_fn = "CLEAN", weights[0][1]
 
             result = gen_fn(rng, merchant, run_date, fee_schedule, cal)
             all_results.append(result)
@@ -164,6 +178,8 @@ def generate_seed(seed: str, days: int = 10, start_date: date | None = None) -> 
                 if srow.get("utr"):
                     gt["utr"] = srow["utr"]
                     break
+            if gt.get("shared_utr") and not gt.get("utr"):
+                gt["utr"] = gt["shared_utr"]
             label = gt.get("archetype", name)
             label_counts[label] += 1
 
@@ -230,7 +246,8 @@ def generate_seed(seed: str, days: int = 10, start_date: date | None = None) -> 
         "seed": seed,
         "days": days,
         "start_date": start_date.isoformat(),
-        "record_count_target": RECORD_COUNT,
+        "dense": dense,
+        "record_count_target": target_records,
         "records_generated": sum(totals),
         "merchants": len(merchants),
         "label_counts": dict(sorted(label_counts.items())),
