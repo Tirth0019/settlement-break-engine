@@ -237,16 +237,50 @@ Answers *"how do you know your verifier isn't just agreeing with itself?"* — w
 
 ---
 
-## Hold-out seed 9999 (FINAL_PLAN §1.1 — generated, L3 not yet run)
+## Hold-out seed 9999 (Aug 31 — day 1 partial)
 
-`sbe generate --seed 9999 --dense --target-breaks 60` → **86 records**. `validate_seed` green. `sbe run` **all_tied=True**.
+**§1.1–1.4 complete on partial pool.** L3 **14/64** (quota at break 15). L4 **13/14** L3-verdicted. See `FINAL_PLAN.md`.
 
-| OPEN labeled | n |
+| Metric | Status |
 |---|---|
-| CHARGEBACK_PLUS_FEE | 17 |
-| TRUE_LEAKAGE | 15 |
-| TDS_194O | 11 |
-| FEE_PLUS_GST | 10 |
-| unlabeled | 3 of 64 OPEN (4.7%) |
+| L3 FEE | **7/7 (100%)** — headline |
+| L3 TDS | **1/7 (14.3%)** — see TDS section below |
+| Leakage recall | **n/a** — **Tier 0 gap** (0 TRUE_LEAKAGE L3; n=15 untouched) |
+| L4 verifier | Per-archetype finding — see Verifier section below |
 
-~50 L3 covers **50/61 labelled ≈ 82%** (≥70% gate). Core trio each n≥8. `UTR_TRUNCATION` still missing from OPEN (cut). No L3 tokens spent on 9999 yet.
+**Sep 1 Groq priority:** TRUE_LEAKAGE (15) → CHARGEBACK (17) → TDS. Stratification reordered in code.
+
+**Sep 1 Google L4:** TRUE_LEAKAGE + CHARGEBACK (`HOLDOUT_L4_PLAN` 8/8/2/2).
+
+---
+
+## TDS_194O (hold-out n=7, Aug 31)
+
+- **Accuracy:** 1/7 (14.3%)
+- **Failure pattern:** Cites missing fee_gst and TDS together but abstains; only `BRK-2026-0313-0002` correct with tools
+- **Why:** Conflates GST-on-fee with TDS-on-gross — §194-O on gross, model applies fee logic to net
+- **Mitigated?** No — frozen agent
+
+---
+
+## L4 abstention guard miss (frozen — BRK-2026-0315-0002)
+
+- **Symptom:** OVERTURN NEEDS_HUMAN → MATCH, residual −147.33; guard did not fire
+- **Mitigated?** No. Scoring excludes row; `--strict-contract` aborts for demo
+
+---
+
+## Verifier — hold-out finding (Aug 31, n=13)
+
+| Archetype | L3 acc | Verifier effect |
+|---|---|---|
+| FEE_PLUS_GST | 100% (7/7) | −42.9pp |
+| TDS_194O | 14.3% (1/7) | +14.3pp |
+
+Report as finding: helps when L3 weak, hurts when strong.
+
+---
+
+## Leakage recall — Tier 0 gap
+
+TRUE_LEAKAGE n=15 OPEN, 0 L3. Highest Sep 1 Groq priority.

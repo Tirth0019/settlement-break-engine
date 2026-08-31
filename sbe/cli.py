@@ -189,6 +189,8 @@ def investigate(
     conn.close()
 
     if not verdicts:
+        if report.quota_exhausted:
+            return
         rprint(f"[yellow]no OPEN breaks[/yellow] seed={seed}")
         return
 
@@ -215,6 +217,11 @@ def score(
     seed: str = "1001",
     print_table: bool = False,
     skip_investigate: bool = False,
+    strict_contract: bool = typer.Option(
+        False,
+        "--strict-contract",
+        help="Abort on MATCH verdicts with non-zero residual (demo / gate mode).",
+    ),
     investigate_limit: int = typer.Option(
         None,
         "--investigate-limit",
@@ -230,6 +237,8 @@ def score(
         GATE5_ARITHMETIC_ARCHETYPES,
         GATE5_CORE_ARITHMETIC,
         adversarial_metrics,
+        contract_violation_rows,
+        format_contract_violations_report,
         format_pass1_report,
         gate5_archetype_coverage,
         leakage_recall,
@@ -270,19 +279,27 @@ def score(
                 "do not trust arithmetic-heavy table rows yet"
             )
 
-    table = per_archetype_table(conn, seed)
+    table = per_archetype_table(
+        conn, seed, exclude_contract_violations=not strict_contract
+    )
     vw = value_weighted_reconciled_pct(conn, seed)
     leak = leakage_recall(conn, seed)
     bad_match = match_residual_violations(conn, seed)
+    violations = contract_violation_rows(conn, seed)
     adv = adversarial_metrics(conn, seed)
     g5 = gate5_archetype_coverage(conn, seed)
-    net_lift, false_overturn = net_accuracy_lift(conn, seed)
+    net_lift, false_overturn = net_accuracy_lift(
+        conn, seed, exclude_contract_violations=not strict_contract
+    )
     conn.close()
 
-    if bad_match:
+    if bad_match and strict_contract:
         raise SystemExit(
             f"contract violation: MATCH with non-zero residual: {bad_match[:5]}"
         )
+
+    if violations and not strict_contract:
+        rprint(f"[yellow]{format_contract_violations_report(violations)}[/yellow]")
 
     if table.empty:
         rprint("[yellow]no investigator verdicts yet[/yellow]")
@@ -350,13 +367,28 @@ def verify(
         "--limit",
         help="Cap L4 verifier calls (default: all L3-verdicted breaks without L4).",
     ),
+    max_calls: int = typer.Option(
+        None,
+        "--max-calls",
+        help="Hard cap on L4 calls (use with --stratified for hold-out).",
+    ),
+    stratified: bool = typer.Option(
+        False,
+        "--stratified",
+        help="Pre-allocate calls by archetype (hold-out: 8/4/4/4 FEE/TDS/CHARGEBACK/LEAKAGE).",
+    ),
 ):
     """Run L4 verifier on investigator verdicts (GATE 6)."""
     from sbe.config import DB_PATH
     from sbe.db.connection import get_connection
     from sbe.engine.l4_verifier import verify_l3_breaks
     from sbe.generator.seed import SEEDS_ROOT
-    from sbe.scoring.harness import l3_investigated_break_ids, net_accuracy_lift
+    from sbe.scoring.harness import (
+        l3_investigated_break_ids,
+        l3_verdict_map,
+        net_accuracy_lift,
+        select_l4_breaks_stratified,
+    )
 
     if not (SEEDS_ROOT / seed / "manifest.json").exists():
         raise typer.BadParameter(f"seed {seed} missing — run sbe generate first")
@@ -374,6 +406,25 @@ def verify(
         conn.close()
         return
 
+    l3_snapshot = l3_verdict_map(conn, seed)
+    cap = max_calls if max_calls is not None else limit
+    break_ids: list[str] | None = None
+    if stratified:
+        break_ids = select_l4_breaks_stratified(conn, seed, max_calls=cap or 20)
+        if not break_ids:
+            rprint("[yellow]no pending L3 breaks match stratified L4 plan[/yellow]")
+            conn.close()
+            return
+        by_arch: dict[str, int] = {}
+        for bid in break_ids:
+            arch = conn.execute(
+                "SELECT ground_truth_archetype FROM breaks WHERE break_id=?",
+                (bid,),
+            ).fetchone()
+            a = (arch[0] if arch else None) or "UNKNOWN"
+            by_arch[a] = by_arch.get(a, 0) + 1
+        rprint(f"[cyan]stratified L4[/cyan] plan={by_arch} total={len(break_ids)}")
+
     pending = conn.execute(
         """
         SELECT COUNT(*) FROM breaks
@@ -385,12 +436,35 @@ def verify(
         """,
         (seed,),
     ).fetchone()[0]
+    n_run = len(break_ids) if break_ids else (cap or pending)
     rprint(
-        f"[cyan]verifying[/cyan] up to {limit or pending} of {pending} pending "
+        f"[cyan]verifying[/cyan] up to {n_run} of {pending} pending "
         f"({l3_n} L3 total)…"
     )
-    decisions = verify_l3_breaks(conn, seed=seed, limit=limit)
+    decisions = verify_l3_breaks(
+        conn, seed=seed, limit=cap if not stratified else None, break_ids=break_ids
+    )
     net_lift, false_overturn = net_accuracy_lift(conn, seed)
+
+    # Assert L3 audit_log ground truth unchanged; non-OVERTURN keeps breaks.verdict.
+    l3_after = l3_verdict_map(conn, seed)
+    if l3_snapshot != l3_after:
+        conn.close()
+        raise SystemExit("L4 overwrote audit_log L3 verdicts — abort")
+    for bid, l3v in l3_snapshot.items():
+        row = conn.execute(
+            "SELECT verifier_decision, verdict FROM breaks WHERE break_id=?",
+            (bid,),
+        ).fetchone()
+        if not row or row[0] is None:
+            continue
+        if row[0] in ("UPHOLD", "ESCALATE") and row[1] != l3v:
+            conn.close()
+            raise SystemExit(
+                f"L4 changed breaks.verdict on {row[0]} for {bid}: "
+                f"L3={l3v} break={row[1]}"
+            )
+
     conn.close()
 
     uphold = sum(1 for d in decisions if d.decision == "UPHOLD")

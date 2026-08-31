@@ -531,6 +531,7 @@ def verify_l3_breaks(
     *,
     seed: str,
     limit: int | None = None,
+    break_ids: list[str] | None = None,
     store: SourceStore | None = None,
     chat_fn: Callable[..., dict | str] | None = None,
 ) -> list[VerifierDecision]:
@@ -541,19 +542,41 @@ def verify_l3_breaks(
     if not l3_ids:
         return []
 
-    placeholders = ",".join("?" * len(l3_ids))
-    rows = conn.execute(
-        f"""
-        SELECT break_id, seed, merchant_id, side, amount_delta, match_key,
-               first_seen_run, verdict, hypothesis, evidence_json,
-               residual_unexplained, confidence, tools_called_json
-          FROM breaks
-         WHERE seed = ? AND break_id IN ({placeholders})
-           AND verifier_decision IS NULL
-         ORDER BY first_seen_run, break_id
-        """,
-        (seed, *sorted(l3_ids)),
-    ).fetchall()
+    if break_ids is not None:
+        ordered = [b for b in break_ids if b in l3_ids]
+        if not ordered:
+            return []
+        placeholders = ",".join("?" * len(ordered))
+        rows = conn.execute(
+            f"""
+            SELECT break_id, seed, merchant_id, side, amount_delta, match_key,
+                   first_seen_run, verdict, hypothesis, evidence_json,
+                   residual_unexplained, confidence, tools_called_json
+              FROM breaks
+             WHERE seed = ? AND break_id IN ({placeholders})
+               AND verifier_decision IS NULL
+            """,
+            (seed, *ordered),
+        ).fetchall()
+        row_map = {r[0]: r for r in rows}
+        rows = [row_map[b] for b in ordered if b in row_map]
+    else:
+        placeholders = ",".join("?" * len(l3_ids))
+        rows = conn.execute(
+            f"""
+            SELECT break_id, seed, merchant_id, side, amount_delta, match_key,
+                   first_seen_run, verdict, hypothesis, evidence_json,
+                   residual_unexplained, confidence, tools_called_json
+              FROM breaks
+             WHERE seed = ? AND break_id IN ({placeholders})
+               AND verifier_decision IS NULL
+             ORDER BY first_seen_run, break_id
+            """,
+            (seed, *sorted(l3_ids)),
+        ).fetchall()
+        if limit is not None:
+            rows = rows[:limit]
+
     cols = [
         "break_id",
         "seed",
@@ -569,9 +592,6 @@ def verify_l3_breaks(
         "confidence",
         "tools_called_json",
     ]
-    if limit is not None:
-        rows = rows[:limit]
-
     source_store = store or SourceStore.load(seed)
     out: list[VerifierDecision] = []
     for row in rows:

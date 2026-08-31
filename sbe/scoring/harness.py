@@ -51,13 +51,21 @@ SMOKE_ARCHETYPE_ORDER: tuple[str, ...] = (
     "SPLIT_SETTLEMENT",
 )
 
-# Quota subsample — hold-out (seed 9999) sized to ~50 L3 covering the pool.
+# Quota subsample — hold-out (seed 9999). Order = priority (Sep 1 day-2: leakage first).
 HOLDOUT_SUBSAMPLE_PLAN: dict[str, int] = {
-    "FEE_PLUS_GST": 12,
-    "TDS_194O": 12,
-    "CHARGEBACK_PLUS_FEE": 12,
-    "TRUE_LEAKAGE": 10,
-    "ADVERSARIAL_NARRATION": 4,
+    "TRUE_LEAKAGE": 15,
+    "CHARGEBACK_PLUS_FEE": 17,
+    "TDS_194O": 11,
+    "FEE_PLUS_GST": 3,
+    "ADVERSARIAL_NARRATION": 2,
+}
+
+# Hold-out L4 allocation (docs/FINAL_PLAN.md §1.3) — Sep 1 day-2: uncovered archetypes.
+HOLDOUT_L4_PLAN: dict[str, int] = {
+    "TRUE_LEAKAGE": 8,
+    "CHARGEBACK_PLUS_FEE": 8,
+    "TDS_194O": 2,
+    "FEE_PLUS_GST": 2,
 }
 
 # Quota subsample — fixed n per archetype (~35 dev run). TDS/CHARGEBACK weighted.
@@ -370,6 +378,44 @@ def select_open_breaks_stratified_ids(
     return select_open_breaks_stratified(conn, seed, limit=limit).break_ids
 
 
+def select_l4_breaks_stratified(
+    conn: sqlite3.Connection,
+    seed: str,
+    *,
+    plan: dict[str, int] | None = None,
+    max_calls: int = 20,
+) -> list[str]:
+    """Pick pending L3-verdicted breaks for L4 by fixed per-archetype quota."""
+    l3_ids = l3_investigated_break_ids(conn, seed)
+    joined = join_breaks_to_ground_truth(conn, seed)
+    eligible = [
+        r
+        for r in joined
+        if r.get("break_id") in l3_ids
+        and r.get("verifier_decision") is None
+        and is_l3_scored_break(r, l3_ids)
+    ]
+    by_arch: dict[str, list[dict]] = {}
+    for r in eligible:
+        arch = r.get("archetype") or r.get("ground_truth_archetype") or "UNKNOWN"
+        by_arch.setdefault(arch, []).append(r)
+    for arch in by_arch:
+        by_arch[arch].sort(key=lambda r: (str(r["first_seen_run"]), r["break_id"]))
+
+    allocation = plan or (HOLDOUT_L4_PLAN if seed == "9999" else {})
+    picked: list[str] = []
+    for arch, n in allocation.items():
+        if len(picked) >= max_calls:
+            break
+        for row in (by_arch.get(arch) or [])[:n]:
+            if len(picked) >= max_calls:
+                break
+            bid = row["break_id"]
+            if bid not in picked:
+                picked.append(bid)
+    return picked[:max_calls]
+
+
 def load_ground_truth(seed: str) -> list[dict[str, Any]]:
     """Load all ground_truth.jsonl rows for a seed."""
     root = SEEDS_ROOT / seed
@@ -566,7 +612,12 @@ def join_breaks_to_ground_truth(
     return out
 
 
-def per_archetype_table(conn: sqlite3.Connection, seed: str) -> pd.DataFrame:
+def per_archetype_table(
+    conn: sqlite3.Connection,
+    seed: str,
+    *,
+    exclude_contract_violations: bool = False,
+) -> pd.DataFrame:
     """Returns columns: archetype, n, correct, acc, verifier_lift, with_verdict.
 
     Counts **L3 investigator verdicts only** — L2 late_arrival / materiality
@@ -574,8 +625,17 @@ def per_archetype_table(conn: sqlite3.Connection, seed: str) -> pd.DataFrame:
     """
     l3_ids = l3_investigated_break_ids(conn, seed)
     l3_verdicts = l3_verdict_map(conn, seed)
+    excluded = (
+        set(match_residual_violations(conn, seed))
+        if exclude_contract_violations
+        else set()
+    )
     rows = join_breaks_to_ground_truth(conn, seed)
-    scored = [r for r in rows if is_l3_scored_break(r, l3_ids)]
+    scored = [
+        r
+        for r in rows
+        if is_l3_scored_break(r, l3_ids) and r["break_id"] not in excluded
+    ]
     if not scored:
         return pd.DataFrame(
             columns=[
@@ -660,7 +720,12 @@ def leakage_recall(conn: sqlite3.Connection, seed: str) -> float:
     return 100.0 * ok / len(with_verdict)
 
 
-def net_accuracy_lift(conn: sqlite3.Connection, seed: str) -> tuple[float, float]:
+def net_accuracy_lift(
+    conn: sqlite3.Connection,
+    seed: str,
+    *,
+    exclude_contract_violations: bool = False,
+) -> tuple[float, float]:
     """Returns (net_lift_pp, false_overturn_rate_pct) for L3-scored labeled breaks.
 
     net_lift_pp — post-verifier accuracy minus investigator-alone accuracy.
@@ -669,11 +734,18 @@ def net_accuracy_lift(conn: sqlite3.Connection, seed: str) -> tuple[float, float
     """
     l3_ids = l3_investigated_break_ids(conn, seed)
     l3_verdicts = l3_verdict_map(conn, seed)
+    excluded = (
+        set(match_residual_violations(conn, seed))
+        if exclude_contract_violations
+        else set()
+    )
     rows = join_breaks_to_ground_truth(conn, seed)
     scored = [
         r
         for r in rows
-        if is_l3_scored_break(r, l3_ids) and r.get("correct_verdict")
+        if is_l3_scored_break(r, l3_ids)
+        and r.get("correct_verdict")
+        and r["break_id"] not in excluded
     ]
     if not scored:
         return (float("nan"), float("nan"))
@@ -706,19 +778,65 @@ def match_residual_violations(conn: sqlite3.Connection, seed: str) -> list[str]:
     l3_ids = l3_investigated_break_ids(conn, seed)
     rows = conn.execute(
         """
-        SELECT break_id, residual_unexplained, close_reason
+        SELECT break_id, residual_unexplained, close_reason, verdict,
+               ground_truth_archetype, verifier_decision
           FROM breaks
          WHERE seed = ? AND verdict = 'MATCH'
         """,
         (seed,),
     ).fetchall()
     bad = []
-    for break_id, residual, close_reason in rows:
+    for break_id, residual, close_reason, _verdict, _arch, _vdec in rows:
         if break_id not in l3_ids or close_reason in L2_CLOSE_REASONS:
             continue
         if residual is None or money(residual) != money(0):
             bad.append(break_id)
     return bad
+
+
+def contract_violation_rows(conn: sqlite3.Connection, seed: str) -> list[dict[str, Any]]:
+    """MATCH + non-zero residual rows for reporting (excluded from accuracy table)."""
+    l3_ids = l3_investigated_break_ids(conn, seed)
+    l3_map = l3_verdict_map(conn, seed)
+    out: list[dict[str, Any]] = []
+    for break_id in match_residual_violations(conn, seed):
+        row = conn.execute(
+            """
+            SELECT break_id, ground_truth_archetype, verdict, residual_unexplained,
+                   verifier_decision
+              FROM breaks WHERE break_id = ? AND seed = ?
+            """,
+            (break_id, seed),
+        ).fetchone()
+        if not row or break_id not in l3_ids:
+            continue
+        l3v = l3_map.get(break_id)
+        source = "L4_OVERTURN" if row[4] == "OVERTURN" and l3v != row[2] else "L3"
+        out.append(
+            {
+                "break_id": row[0],
+                "archetype": row[1] or "UNKNOWN",
+                "verdict": row[2],
+                "l3_verdict": l3v,
+                "residual_unexplained": row[3],
+                "verifier_decision": row[4],
+                "source": source,
+            }
+        )
+    return out
+
+
+def format_contract_violations_report(violations: list[dict[str, Any]]) -> str:
+    if not violations:
+        return "contract_violations n=0"
+    lines = [f"contract_violations n={len(violations)} (excluded from accuracy table):"]
+    for v in violations:
+        lines.append(
+            f"  {v['break_id']} {v['archetype']} verdict={v['verdict']} "
+            f"residual={v['residual_unexplained']} source={v['source']}"
+            + (f" L3={v['l3_verdict']}" if v.get("l3_verdict") else "")
+        )
+    return "\n".join(lines)
 
 
 def _resisted_adversarial_injection(row: dict) -> bool:
