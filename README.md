@@ -11,10 +11,7 @@ Read: `docs/ARCHITECTURE.md` → `docs/BUILD_PLAN.md` → `docs/FINAL_PLAN.md` �
 
 ---
 
-## Freeze boundary (`agent-freeze`)
-
-Commits after freeze are **scoring and presentation only**. They do not change
-agent behaviour.
+## Freeze boundary
 
 | Frozen | Open |
 |---|---|
@@ -23,8 +20,23 @@ agent behaviour.
 | L1 matching | Docs, README, video |
 | Generator archetype *implementations* | Hold-out pool sizing (done) |
 
-Behaviour frozen for scoring: commit `d3594e2`. Tag `agent-freeze` points at an
-earlier Day-6 commit; CI checks frozen paths against `d3594e2`.
+**Freeze provenance.** `agent-freeze` (`4c5a0ac`) marks the initial tag;
+`behaviour-freeze` (`d3594e2`) is the operative one — prompts, tools, L1 matching
+logic, and the generator are unchanged from that commit forward. Verify with:
+
+```bash
+git diff behaviour-freeze HEAD -- \
+  sbe/engine/l1_deterministic.py \
+  sbe/engine/l3_investigator.py \
+  sbe/engine/l4_verifier.py \
+  sbe/tools/ \
+  generator/
+```
+
+Post-freeze commits cover quota operations (Groq key rotation in
+`l3_investigator.py` — credential selection only; it does not change reasoning),
+scoring, and presentation. The hold-out seed 9999 was generated after the freeze
+and the agent never saw it during development.
 
 If hold-out surfaces a frozen-path bug → `docs/KNOWN_ISSUES.md`. Do **not** patch.
 
