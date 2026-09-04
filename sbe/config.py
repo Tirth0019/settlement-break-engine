@@ -7,11 +7,17 @@ load_dotenv()
 INVESTIGATOR_PROVIDER = os.getenv("INVESTIGATOR_PROVIDER", "")
 INVESTIGATOR_MODEL = os.getenv("INVESTIGATOR_MODEL", "")
 INVESTIGATOR_API_KEY = os.getenv("INVESTIGATOR_API_KEY", "")
+INVESTIGATOR_KEY_2 = os.getenv("INVESTIGATOR_KEY_2", "")
 
-# Optional L3 fallback when primary quota is unavailable (flagged in audit_log).
+# Optional L3 fallback when all Groq keys exhausted (flagged in audit_log).
 INVESTIGATOR_FALLBACK_PROVIDER = os.getenv("INVESTIGATOR_FALLBACK_PROVIDER", "")
 INVESTIGATOR_FALLBACK_MODEL = os.getenv("INVESTIGATOR_FALLBACK_MODEL", "")
 INVESTIGATOR_FALLBACK_API_KEY = os.getenv("INVESTIGATOR_FALLBACK_API_KEY", "")
+
+
+def investigator_api_keys() -> list[str]:
+    """Ordered Groq (or primary) keys — rotate on quota/auth before Google fallback."""
+    return [k for k in (INVESTIGATOR_API_KEY, INVESTIGATOR_KEY_2) if k]
 
 VERIFIER_PROVIDER = os.getenv("VERIFIER_PROVIDER", "")
 VERIFIER_MODEL = os.getenv("VERIFIER_MODEL", "")

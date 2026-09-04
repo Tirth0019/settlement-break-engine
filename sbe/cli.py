@@ -118,6 +118,11 @@ def investigate(
         "--test-fallback",
         help="Force dead primary model ID to verify INVESTIGATOR_FALLBACK_* wiring",
     ),
+    test_key_rotation: bool = typer.Option(
+        False,
+        "--test-key-rotation",
+        help="Force invalid INVESTIGATOR_API_KEY; expect INVESTIGATOR_KEY_2 + audit key_index=2",
+    ),
     through_day: int = typer.Option(
         None, "--through-day", help="Run L1+L2+L5 through this day first"
     ),
@@ -143,6 +148,8 @@ def investigate(
     ).fetchone()[0] == 0:
         run_seed(conn, seed=seed)
 
+    if test_fallback and test_key_rotation:
+        raise typer.BadParameter("use --test-fallback or --test-key-rotation, not both")
     primary_override = "__dead_primary_for_fallback_test__" if test_fallback else None
     if test_fallback:
         from sbe import config
@@ -152,6 +159,16 @@ def investigate(
                 "INVESTIGATOR_FALLBACK_* must be set for --test-fallback"
             )
         rprint("[cyan]test-fallback[/cyan] primary model forced dead; expect fallback")
+    if test_key_rotation:
+        from sbe import config
+
+        if not config.INVESTIGATOR_KEY_2:
+            raise typer.BadParameter(
+                "INVESTIGATOR_KEY_2 must be set for --test-key-rotation"
+            )
+        rprint(
+            "[cyan]test-key-rotation[/cyan] key 1 forced invalid; expect key_index=2 in audit_log"
+        )
 
     verdicts, report = investigate_open_breaks(
         conn,
@@ -160,6 +177,7 @@ def investigate(
         smoke=smoke,
         subsample=subsample,
         primary_model_override=primary_override,
+        test_key_rotation=test_key_rotation,
     )
     from sbe.scoring.harness import format_pass1_report
 
@@ -186,6 +204,26 @@ def investigate(
                 f"--test-fallback failed: no fallback=true in audit_log for {bid}"
             )
         rprint(f"[green]fallback OK[/green] audit_log provider={prov[0][:120]}")
+    if test_key_rotation and verdicts:
+        bid = verdicts[0].break_id
+        prov = conn.execute(
+            """
+            SELECT new_value FROM audit_log
+             WHERE break_id=? AND who='l3_investigator' AND what='provider'
+             ORDER BY audit_id DESC LIMIT 1
+            """,
+            (bid,),
+        ).fetchone()
+        if not prov:
+            conn.close()
+            raise SystemExit(f"--test-key-rotation failed: no provider audit for {bid}")
+        payload = json.loads(prov[0])
+        if payload.get("key_index") != 2 or payload.get("fallback") is True:
+            conn.close()
+            raise SystemExit(
+                f"--test-key-rotation failed: expected key_index=2 fallback=false, got {prov[0][:200]}"
+            )
+        rprint(f"[green]key-rotation OK[/green] audit_log key_index={payload['key_index']}")
     conn.close()
 
     if not verdicts:
@@ -375,7 +413,12 @@ def verify(
     stratified: bool = typer.Option(
         False,
         "--stratified",
-        help="Pre-allocate calls by archetype (hold-out: 8/4/4/4 FEE/TDS/CHARGEBACK/LEAKAGE).",
+        help="Allocate L4 from pending L3 by priority (leakage first); dynamic fill to --max-calls.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Show L4 allocation from current L3 pool only; no verifier API calls.",
     ),
 ):
     """Run L4 verifier on investigator verdicts (GATE 6)."""
@@ -384,10 +427,11 @@ def verify(
     from sbe.engine.l4_verifier import verify_l3_breaks
     from sbe.generator.seed import SEEDS_ROOT
     from sbe.scoring.harness import (
+        format_l4_allocation_report,
         l3_investigated_break_ids,
         l3_verdict_map,
         net_accuracy_lift,
-        select_l4_breaks_stratified,
+        preview_l4_allocation,
     )
 
     if not (SEEDS_ROOT / seed / "manifest.json").exists():
@@ -409,21 +453,17 @@ def verify(
     l3_snapshot = l3_verdict_map(conn, seed)
     cap = max_calls if max_calls is not None else limit
     break_ids: list[str] | None = None
-    if stratified:
-        break_ids = select_l4_breaks_stratified(conn, seed, max_calls=cap or 20)
-        if not break_ids:
-            rprint("[yellow]no pending L3 breaks match stratified L4 plan[/yellow]")
+    if stratified or dry_run:
+        preview = preview_l4_allocation(conn, seed, max_calls=cap or 20)
+        rprint(format_l4_allocation_report(preview))
+        if dry_run:
             conn.close()
             return
-        by_arch: dict[str, int] = {}
-        for bid in break_ids:
-            arch = conn.execute(
-                "SELECT ground_truth_archetype FROM breaks WHERE break_id=?",
-                (bid,),
-            ).fetchone()
-            a = (arch[0] if arch else None) or "UNKNOWN"
-            by_arch[a] = by_arch.get(a, 0) + 1
-        rprint(f"[cyan]stratified L4[/cyan] plan={by_arch} total={len(break_ids)}")
+        break_ids = preview.break_ids
+        if not break_ids:
+            rprint("[yellow]no pending L3 breaks for L4 — run investigate first[/yellow]")
+            conn.close()
+            return
 
     pending = conn.execute(
         """
@@ -513,10 +553,49 @@ def check(what: str, seed: str = "1001", day: int = None):
         _check_rollforward(seed=seed, day=day)
     elif what == "residuals":
         _check_residuals(seed=seed)
+    elif what == "l4-plan":
+        _check_l4_plan(seed=seed)
+    elif what == "l3-landed":
+        _check_l3_landed(seed=seed)
     else:
         raise typer.BadParameter(
-            f"unknown check {what!r}; expected surfacing|idempotency|rollforward|residuals"
+            f"unknown check {what!r}; expected "
+            "surfacing|idempotency|rollforward|residuals|l4-plan|l3-landed"
         )
+
+
+def _check_l3_landed(seed: str) -> None:
+    from sbe.config import DB_PATH
+    from sbe.db.connection import get_connection
+    from sbe.scoring.harness import (
+        format_l3_landed_report,
+        l3_counts_by_archetype,
+        pending_l4_by_archetype,
+    )
+
+    db_path = Path(DB_PATH).parent / f"sbe_{seed}.db"
+    if not db_path.exists():
+        raise typer.BadParameter(f"no db for seed {seed}")
+    conn = get_connection(str(db_path))
+    l3 = l3_counts_by_archetype(conn, seed)
+    pending = pending_l4_by_archetype(conn, seed)
+    conn.close()
+    rprint(format_l3_landed_report(l3, pending))
+
+
+def _check_l4_plan(seed: str) -> None:
+    from sbe.config import DB_PATH
+    from sbe.db.connection import get_connection
+    from sbe.scoring.harness import format_l4_allocation_report, preview_l4_allocation
+
+    db_path = Path(DB_PATH).parent / f"sbe_{seed}.db"
+    if not db_path.exists():
+        raise typer.BadParameter(f"no db for seed {seed}")
+    conn = get_connection(str(db_path))
+    preview = preview_l4_allocation(conn, seed, max_calls=20)
+    conn.close()
+    rprint(format_l4_allocation_report(preview))
+    rprint("[green]l4-plan OK[/green] (dry-run — no API calls)")
 
 
 def _check_surfacing(seed: str) -> None:
@@ -640,6 +719,130 @@ def _check_residuals(seed: str) -> None:
             f"RESIDUALS FAIL seed={seed}: L3 MATCH with non-zero residual: {bad[:5]}"
         )
     rprint(f"[green]residuals OK[/green] seed={seed} l3_verdicts={n_l3}")
+
+
+@app.command()
+def cost(seed: str = "9999"):
+    """Estimate L3/L4 token + ₹ cost for a seed (FINAL_PLAN §2.1)."""
+    from sbe.config import DB_PATH
+    from sbe.db.connection import get_connection
+    from sbe.scoring.cost import estimate_seed_cost, format_cost_report
+
+    db_path = Path(DB_PATH).parent / f"sbe_{seed}.db"
+    if not db_path.exists():
+        raise typer.BadParameter(f"no db for seed {seed}")
+    conn = get_connection(str(db_path))
+    report = estimate_seed_cost(conn, seed)
+    conn.close()
+    rprint(format_cost_report(report))
+
+
+@app.command()
+def calibrate(seed: str = "9999"):
+    """3-bin confidence calibration + ECE (FINAL_PLAN §2.2)."""
+    from sbe.config import DB_PATH
+    from sbe.db.connection import get_connection
+    from sbe.scoring.calibration import calibrate_seed, format_calibration_report
+
+    db_path = Path(DB_PATH).parent / f"sbe_{seed}.db"
+    if not db_path.exists():
+        raise typer.BadParameter(f"no db for seed {seed}")
+    conn = get_connection(str(db_path))
+    report = calibrate_seed(conn, seed)
+    conn.close()
+    rprint(format_calibration_report(report))
+
+
+@app.command("graduate")
+def graduate_cmd(seed: str = "9999", min_n: int = 5):
+    """Detect rule-graduation candidates — DETECTION ONLY (FINAL_PLAN §2.3)."""
+    from sbe.config import DB_PATH
+    from sbe.db.connection import get_connection
+    from sbe.engine.l7_graduation import (
+        detect_graduation_from_db,
+        format_graduation_report,
+        llm_calls_by_day,
+    )
+
+    db_path = Path(DB_PATH).parent / f"sbe_{seed}.db"
+    if not db_path.exists():
+        raise typer.BadParameter(f"no db for seed {seed}")
+    conn = get_connection(str(db_path))
+    props, declines = detect_graduation_from_db(conn, seed, min_occurrences=min_n)
+    chart = llm_calls_by_day(conn)
+    conn.close()
+    rprint(format_graduation_report(props, declines))
+    rprint(f"llm_calls_by_day: {chart['status']} — {chart['reason']}")
+
+
+@app.command()
+def packet(
+    break_id: str,
+    seed: str = "9999",
+):
+    """Render one L6 break packet (FINAL_PLAN §2.4)."""
+    from sbe.config import DB_PATH
+    from sbe.db.connection import get_connection
+    from sbe.engine.l6_packets import render_break_packet
+
+    db_path = Path(DB_PATH).parent / f"sbe_{seed}.db"
+    if not db_path.exists():
+        raise typer.BadParameter(f"no db for seed {seed}")
+    conn = get_connection(str(db_path))
+    row = conn.execute(
+        """
+        SELECT break_id, merchant_id, amount_delta, age_days, verdict, hypothesis,
+               residual_unexplained, confidence, evidence_json, verifier_decision,
+               ground_truth_archetype
+          FROM breaks WHERE break_id = ? AND seed = ?
+        """,
+        (break_id, seed),
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise typer.BadParameter(f"break {break_id} not found on seed {seed}")
+    cols = [
+        "break_id",
+        "merchant_id",
+        "amount_delta",
+        "age_days",
+        "verdict",
+        "hypothesis",
+        "residual_unexplained",
+        "confidence",
+        "evidence_json",
+        "verifier_decision",
+        "ground_truth_archetype",
+    ]
+    rprint(render_break_packet(dict(zip(cols, row))))
+
+
+@app.command()
+def certificate(
+    seed: str = "9999",
+    run_date: str = typer.Option(..., "--date", help="Run date YYYY-MM-DD"),
+    phantom: bool = typer.Option(
+        False, "--phantom", help="Inject phantom break → refuse publish (demo)"
+    ),
+):
+    """Render reconciliation certificate (FINAL_PLAN §2.5)."""
+    from sbe.config import DB_PATH
+    from sbe.db.connection import get_connection
+    from sbe.engine.certificate import publish_or_refuse
+    from sbe.engine.l5_rollforward import RollForwardBreak
+
+    db_path = Path(DB_PATH).parent / f"sbe_{seed}.db"
+    if not db_path.exists():
+        raise typer.BadParameter(f"no db for seed {seed}")
+    conn = get_connection(str(db_path))
+    try:
+        text = publish_or_refuse(conn, seed, run_date, inject_phantom=phantom)
+        rprint(text)
+    except RollForwardBreak as exc:
+        rprint(f"[red]{exc}[/red]")
+        raise SystemExit(1) from exc
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

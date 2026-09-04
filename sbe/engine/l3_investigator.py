@@ -672,6 +672,29 @@ def _primary_unavailable(exc: Exception) -> bool:
     return False
 
 
+def _should_rotate_investigator_key(exc: BaseException) -> bool:
+    """True when another Groq key may succeed (quota or auth on key N)."""
+    if isinstance(exc, QuotaExhaustedError):
+        return True
+    if quota_exhausted_from_error(exc) is not None:
+        return True
+    msg = str(exc).lower()
+    return (
+        "invalid_api_key" in msg
+        or "incorrect api key" in msg
+        or "invalid credentials" in msg
+        or "authentication" in msg
+        or "401" in msg
+    )
+
+
+def _investigator_api_keys(*, test_key_rotation: bool = False) -> list[str]:
+    keys = list(config.investigator_api_keys())
+    if test_key_rotation and len(keys) >= 2:
+        keys[0] = "__invalid_key_for_rotation_test__"
+    return keys
+
+
 def _investigator_completion(
     messages: list[dict],
     tools: list[dict],
@@ -679,8 +702,9 @@ def _investigator_completion(
     chat_fn: Callable | None,
     primary_client,
     primary_model: str,
+    allow_provider_fallback: bool = False,
 ) -> tuple[Any, str, bool]:
-    """Call L3 model; on primary failure optionally switch to configured fallback."""
+    """Call L3 model; optional Google fallback when all Groq keys exhausted."""
     if chat_fn is not None:
         return chat_fn(messages, tools), primary_model, False
     try:
@@ -690,7 +714,11 @@ def _investigator_completion(
             False,
         )
     except Exception as exc:
-        if not config.INVESTIGATOR_FALLBACK_API_KEY or not _primary_unavailable(exc):
+        if isinstance(exc, QuotaExhaustedError) and not allow_provider_fallback:
+            raise
+        if not allow_provider_fallback or not config.INVESTIGATOR_FALLBACK_API_KEY:
+            raise
+        if not _primary_unavailable(exc):
             raise
         fb_client, fb_model = _provider_client(
             config.INVESTIGATOR_FALLBACK_PROVIDER,
@@ -713,6 +741,9 @@ def investigate(
     max_turns: int = 10,
     chat_fn: Callable | None = None,
     primary_model_override: str | None = None,
+    api_key: str | None = None,
+    key_index: int = 1,
+    allow_provider_fallback: bool = False,
 ) -> InvestigatorVerdict:
     """Run the investigator tool loop for one break.
 
@@ -741,11 +772,12 @@ def investigate(
     model = primary_model_override or config.INVESTIGATOR_MODEL
     used_fallback = False
     if chat_fn is None:
-        if not config.INVESTIGATOR_API_KEY:
+        active_key = api_key or config.INVESTIGATOR_API_KEY
+        if not active_key:
             raise RuntimeError("INVESTIGATOR_API_KEY missing — cannot call L3")
         client, model = _provider_client(
             config.INVESTIGATOR_PROVIDER,
-            config.INVESTIGATOR_API_KEY,
+            active_key,
             model,
         )
         if isinstance(client, tuple) and client[0] == "anthropic":
@@ -762,6 +794,7 @@ def investigate(
             chat_fn=chat_fn,
             primary_client=client,
             primary_model=model,
+            allow_provider_fallback=allow_provider_fallback,
         )
         used_fallback = used_fallback or turn_fallback
 
@@ -888,9 +921,49 @@ def investigate(
         )
 
     if conn is not None:
-        _persist_verdict(conn, verdict, model=model, used_fallback=used_fallback)
+        _persist_verdict(
+            conn,
+            verdict,
+            model=model,
+            used_fallback=used_fallback,
+            key_index=key_index,
+        )
 
     return verdict
+
+
+def _run_investigate_with_key_rotation(
+    break_record: dict,
+    *,
+    store: SourceStore,
+    conn: sqlite3.Connection,
+    primary_model_override: str | None = None,
+    test_key_rotation: bool = False,
+) -> InvestigatorVerdict:
+    """Try INVESTIGATOR_API_KEY then INVESTIGATOR_KEY_2; Google only on last key."""
+    keys = _investigator_api_keys(test_key_rotation=test_key_rotation)
+    if not keys:
+        raise RuntimeError("INVESTIGATOR_API_KEY missing — cannot call L3")
+    last_exc: Exception | None = None
+    for ki, active_key in enumerate(keys):
+        allow_fb = ki == len(keys) - 1
+        try:
+            return investigate(
+                break_record,
+                store=store,
+                conn=conn,
+                primary_model_override=primary_model_override,
+                api_key=active_key,
+                key_index=ki + 1,
+                allow_provider_fallback=allow_fb,
+            )
+        except Exception as exc:
+            last_exc = exc
+            if ki + 1 < len(keys) and _should_rotate_investigator_key(exc):
+                continue
+            raise
+    assert last_exc is not None
+    raise last_exc
 
 
 def _persist_verdict(
@@ -899,6 +972,7 @@ def _persist_verdict(
     *,
     model: str | None = None,
     used_fallback: bool = False,
+    key_index: int = 1,
 ) -> None:
     from sbe.engine.l2_break_ledger import append_audit
 
@@ -948,6 +1022,7 @@ def _persist_verdict(
                     "model": model,
                     "fallback": used_fallback,
                     "primary_provider": config.INVESTIGATOR_PROVIDER,
+                    "key_index": key_index,
                 }
             ),
             at=datetime.utcnow().isoformat(),
@@ -964,6 +1039,7 @@ def investigate_open_breaks(
     smoke: bool = False,
     subsample: bool = False,
     primary_model_override: str | None = None,
+    test_key_rotation: bool = False,
 ) -> tuple[list[InvestigatorVerdict], "InvestigateRunReport"]:
     """Investigate OPEN breaks for a seed (investigator-alone, no verifier).
 
@@ -1039,11 +1115,12 @@ def investigate_open_breaks(
             rec["_archetype_hint"] = meta[break_id]["archetype"]
         try:
             out.append(
-                investigate(
+                _run_investigate_with_key_rotation(
                     rec,
                     store=source_store,
                     conn=conn,
                     primary_model_override=primary_model_override,
+                    test_key_rotation=test_key_rotation,
                 )
             )
             report.succeeded.append(break_id)

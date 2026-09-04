@@ -60,13 +60,14 @@ HOLDOUT_SUBSAMPLE_PLAN: dict[str, int] = {
     "ADVERSARIAL_NARRATION": 2,
 }
 
-# Hold-out L4 allocation (docs/FINAL_PLAN.md §1.3) — Sep 1 day-2: uncovered archetypes.
-HOLDOUT_L4_PLAN: dict[str, int] = {
-    "TRUE_LEAKAGE": 8,
-    "CHARGEBACK_PLUS_FEE": 8,
-    "TDS_194O": 2,
-    "FEE_PLUS_GST": 2,
-}
+# Hold-out L4 priority (docs/FINAL_PLAN.md) — fill up to max_calls from pending L3
+# in this order after L3 completes; no fixed per-archetype quota.
+HOLDOUT_L4_PRIORITY: tuple[str, ...] = (
+    "TRUE_LEAKAGE",
+    "CHARGEBACK_PLUS_FEE",
+    "TDS_194O",
+    "FEE_PLUS_GST",
+)
 
 # Quota subsample — fixed n per archetype (~35 dev run). TDS/CHARGEBACK weighted.
 QUOTA_SUBSAMPLE_PLAN: dict[str, int] = {
@@ -378,14 +379,93 @@ def select_open_breaks_stratified_ids(
     return select_open_breaks_stratified(conn, seed, limit=limit).break_ids
 
 
+@dataclass
+class L4AllocationPreview:
+    """Proposed L4 calls from pending L3 verdicts (no API)."""
+
+    break_ids: list[str]
+    by_archetype: dict[str, int]
+    pending_l4_by_archetype: dict[str, int]
+    l3_total_by_archetype: dict[str, int]
+    max_calls: int
+
+
+def l3_counts_by_archetype(conn: sqlite3.Connection, seed: str) -> dict[str, int]:
+    """L3 investigator verdicts per archetype (audit_log ground truth)."""
+    l3_ids = l3_investigated_break_ids(conn, seed)
+    joined = join_breaks_to_ground_truth(conn, seed)
+    counts: dict[str, int] = {}
+    for r in joined:
+        if r.get("break_id") not in l3_ids or not is_l3_scored_break(r, l3_ids):
+            continue
+        arch = r.get("archetype") or "UNKNOWN"
+        counts[arch] = counts.get(arch, 0) + 1
+    return counts
+
+
+def pending_l4_by_archetype(conn: sqlite3.Connection, seed: str) -> dict[str, int]:
+    """Pending L4 slots per archetype (L3 verdict, no verifier_decision yet)."""
+    l3_ids = l3_investigated_break_ids(conn, seed)
+    joined = join_breaks_to_ground_truth(conn, seed)
+    counts: dict[str, int] = {}
+    for r in joined:
+        if (
+            r.get("break_id") not in l3_ids
+            or r.get("verifier_decision") is not None
+            or not is_l3_scored_break(r, l3_ids)
+        ):
+            continue
+        arch = r.get("archetype") or "UNKNOWN"
+        counts[arch] = counts.get(arch, 0) + 1
+    return counts
+
+
+def format_l3_landed_report(
+    l3_by_arch: dict[str, int], pending_l4: dict[str, int]
+) -> str:
+    lines = ["L3 landed (investigator verdicts by archetype):"]
+    if not l3_by_arch:
+        lines.append("  (none — run sbe investigate first)")
+        return "\n".join(lines)
+    for arch in sorted(l3_by_arch.keys()):
+        pend = pending_l4.get(arch, 0)
+        lines.append(f"  {arch:28s} L3={l3_by_arch[arch]} pending_L4={pend}")
+    return "\n".join(lines)
+
+
+def format_l4_allocation_report(preview: L4AllocationPreview) -> str:
+    lines = [
+        format_l3_landed_report(preview.l3_total_by_archetype, preview.pending_l4_by_archetype),
+        f"L4 allocation (priority fill, max={preview.max_calls}): total={len(preview.break_ids)}",
+    ]
+    if preview.by_archetype:
+        for arch, n in preview.by_archetype.items():
+            lines.append(f"  {arch:28s} {n}")
+    else:
+        lines.append("  (empty — no pending L3 to verify)")
+    return "\n".join(lines)
+
+
 def select_l4_breaks_stratified(
     conn: sqlite3.Connection,
     seed: str,
     *,
-    plan: dict[str, int] | None = None,
+    priority: tuple[str, ...] | None = None,
     max_calls: int = 20,
 ) -> list[str]:
-    """Pick pending L3-verdicted breaks for L4 by fixed per-archetype quota."""
+    """Pick pending L3-verdicted breaks for L4 — priority order, dynamic fill to max_calls."""
+    preview = preview_l4_allocation(conn, seed, max_calls=max_calls, priority=priority)
+    return preview.break_ids
+
+
+def preview_l4_allocation(
+    conn: sqlite3.Connection,
+    seed: str,
+    *,
+    priority: tuple[str, ...] | None = None,
+    max_calls: int = 20,
+) -> L4AllocationPreview:
+    """Dry-run L4 selection from whatever L3 actually landed (no API)."""
     l3_ids = l3_investigated_break_ids(conn, seed)
     joined = join_breaks_to_ground_truth(conn, seed)
     eligible = [
@@ -402,18 +482,27 @@ def select_l4_breaks_stratified(
     for arch in by_arch:
         by_arch[arch].sort(key=lambda r: (str(r["first_seen_run"]), r["break_id"]))
 
-    allocation = plan or (HOLDOUT_L4_PLAN if seed == "9999" else {})
+    order = priority or (HOLDOUT_L4_PRIORITY if seed == "9999" else ())
     picked: list[str] = []
-    for arch, n in allocation.items():
+    picked_by_arch: dict[str, int] = {}
+    for arch in order:
         if len(picked) >= max_calls:
             break
-        for row in (by_arch.get(arch) or [])[:n]:
+        for row in by_arch.get(arch) or []:
             if len(picked) >= max_calls:
                 break
             bid = row["break_id"]
             if bid not in picked:
                 picked.append(bid)
-    return picked[:max_calls]
+                picked_by_arch[arch] = picked_by_arch.get(arch, 0) + 1
+
+    return L4AllocationPreview(
+        break_ids=picked[:max_calls],
+        by_archetype=picked_by_arch,
+        pending_l4_by_archetype=pending_l4_by_archetype(conn, seed),
+        l3_total_by_archetype=l3_counts_by_archetype(conn, seed),
+        max_calls=max_calls,
+    )
 
 
 def load_ground_truth(seed: str) -> list[dict[str, Any]]:

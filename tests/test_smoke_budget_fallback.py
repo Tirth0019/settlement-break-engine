@@ -130,6 +130,9 @@ def test_fallback_fires_on_dead_primary_and_audits(tmp_path, monkeypatch):
                 rec,
                 conn=conn,
                 primary_model_override="__dead_primary_for_fallback_test__",
+                # Direct call: enable Google fallback (batch path enables it only
+                # after Groq key rotation is exhausted).
+                allow_provider_fallback=True,
             )
 
     prov = conn.execute(
@@ -142,4 +145,76 @@ def test_fallback_fires_on_dead_primary_and_audits(tmp_path, monkeypatch):
     assert prov is not None
     payload = json.loads(prov[0])
     assert payload["fallback"] is True
+    conn.close()
+
+
+def test_key_rotation_uses_second_key_and_audits_index(tmp_path, monkeypatch):
+    conn = get_connection(str(tmp_path / "keyrot.db"))
+    bid = _open(conn, "FEE_PLUS_GST", "KR01")
+    rec = {
+        "break_id": bid,
+        "seed": SEED,
+        "merchant_id": "M_KR01",
+        "side": "AMOUNT_MISMATCH",
+        "amount_delta": "-10.00",
+        "match_key": "UTR-KR01",
+        "first_seen_run": "2026-03-10",
+        "status": "OPEN",
+    }
+    calls = {"n": 0, "keys": []}
+
+    def fake_provider(provider, api_key, model):
+        calls["keys"].append(api_key)
+        return (object(), model)
+
+    def fake_chat(client, model, messages, tools):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise Exception("401 invalid_api_key")
+        args = json.dumps(
+            {
+                "verdict": "NEEDS_HUMAN",
+                "hypothesis": "key 2 path",
+                "evidence": [],
+                "residual_unexplained": "10.00",
+                "confidence": 0.5,
+            }
+        )
+        tc = SimpleNamespace(
+            id="tc1",
+            function=SimpleNamespace(name="submit_verdict", arguments=args),
+        )
+        msg = SimpleNamespace(content="", tool_calls=[tc])
+        return SimpleNamespace(choices=[SimpleNamespace(message=msg)])
+
+    monkeypatch.setattr("sbe.config.INVESTIGATOR_API_KEY", "bad-key-1")
+    monkeypatch.setattr("sbe.config.INVESTIGATOR_KEY_2", "good-key-2")
+    monkeypatch.setattr("sbe.config.investigator_api_keys", lambda: ["bad-key-1", "good-key-2"])
+
+    from sbe.engine.l3_investigator import _run_investigate_with_key_rotation
+
+    with patch("sbe.engine.l3_investigator._provider_client", side_effect=fake_provider):
+        with patch(
+            "sbe.engine.l3_investigator._chat_openai_compatible",
+            side_effect=fake_chat,
+        ):
+            _run_investigate_with_key_rotation(
+                rec,
+                store=None,
+                conn=conn,
+                test_key_rotation=True,
+            )
+
+    prov = conn.execute(
+        """
+        SELECT new_value FROM audit_log
+         WHERE break_id=? AND who='l3_investigator' AND what='provider'
+        """,
+        (bid,),
+    ).fetchone()
+    assert prov is not None
+    payload = json.loads(prov[0])
+    assert payload["key_index"] == 2
+    assert payload["fallback"] is False
+    assert "good-key-2" in calls["keys"]
     conn.close()

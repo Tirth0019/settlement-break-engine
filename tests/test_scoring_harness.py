@@ -17,6 +17,7 @@ from sbe.scoring.harness import (
     net_accuracy_lift,
     per_archetype_table,
     post_verifier_verdict,
+    preview_l4_allocation,
     select_open_breaks_stratified,
 )
 
@@ -195,4 +196,35 @@ def test_adversarial_split_metrics(tmp_path):
     assert m["n"] == 1
     assert m["resisted_injection"] == 1
     assert m["correct_verdict"] == 0  # ground truth join may lack correct_verdict
+    conn.close()
+
+
+def test_l4_allocation_fills_by_priority_from_pending_l3(tmp_path):
+    conn = get_connection(str(tmp_path / "l4plan.db"))
+    ids = {}
+    for arch in ("FEE_PLUS_GST", "TRUE_LEAKAGE", "CHARGEBACK_PLUS_FEE"):
+        ids[arch] = _open(conn, arch_hint=arch, bid_suffix=arch[:4], amt="-10.00")
+        conn.execute(
+            """
+            UPDATE breaks SET verdict='MATCH', hypothesis='h', confidence=0.9,
+                   evidence_json='[]', residual_unexplained='0.00',
+                   tools_called_json='[]', ground_truth_archetype=?
+             WHERE break_id=?
+            """,
+            (arch, ids[arch]),
+        )
+        append_audit(conn, ids[arch], "l3_investigator", "verdict", None, "MATCH")
+    conn.commit()
+    preview = preview_l4_allocation(
+        conn,
+        SEED,
+        max_calls=20,
+        priority=("TRUE_LEAKAGE", "CHARGEBACK_PLUS_FEE", "FEE_PLUS_GST"),
+    )
+    assert preview.break_ids == [
+        ids["TRUE_LEAKAGE"],
+        ids["CHARGEBACK_PLUS_FEE"],
+        ids["FEE_PLUS_GST"],
+    ]
+    assert preview.by_archetype["TRUE_LEAKAGE"] == 1
     conn.close()

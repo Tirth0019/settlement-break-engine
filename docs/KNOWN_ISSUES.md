@@ -237,24 +237,53 @@ Answers *"how do you know your verifier isn't just agreeing with itself?"* — w
 
 ---
 
-## Hold-out seed 9999 (Aug 31 — day 1 partial)
+## Hold-out seed 9999 (Sep 3 — complete)
 
-**§1.1–1.4 complete on partial pool.** L3 **14/64** (quota at break 15). L4 **13/14** L3-verdicted. See `FINAL_PLAN.md`.
+**L3 n=44** (FEE 7, TDS 9, CHARGEBACK 13, TRUE_LEAKAGE 15). **L4 n=30** cumulative.
 
-| Metric | Status |
+| Metric | Result |
 |---|---|
-| L3 FEE | **7/7 (100%)** — headline |
-| L3 TDS | **1/7 (14.3%)** — see TDS section below |
-| Leakage recall | **n/a** — **Tier 0 gap** (0 TRUE_LEAKAGE L3; n=15 untouched) |
-| L4 verifier | Per-archetype finding — see Verifier section below |
+| L3 FEE | **7/7 (100%)** |
+| Leakage recall | **11/15 (73.3%)** — Tier 0 closed |
+| L3 CHARGEBACK | 4/13 (30.8%) |
+| L3 TDS | 1/8 (12.5%) |
+| Net verifier lift | **−11.6pp** (false overturn 71.4%) — report as finding |
+| Unlabeled OPEN | 3/64 (4.7%) |
+| Rule graduation | none proposed — reasoned refusal (see `sbe graduate`); every high-n archetype fails the bar (L4 OVERTURN and/or non-identical L3) |
 
-**Sep 1 Groq priority:** TRUE_LEAKAGE (15) → CHARGEBACK (17) → TDS. Stratification reordered in code.
+4 of 15 TRUE_LEAKAGE returned MATCH (tautological residual=0 on bank shortfall) —
+failure mode: investigator equates "delta equals bank shortfall" with explanation.
 
-**Sep 1 Google L4:** TRUE_LEAKAGE + CHARGEBACK (`HOLDOUT_L4_PLAN` 8/8/2/2).
+Calibration (n=44): ECE ≈ 0.22; mid bin thin (n=3). High-confidence bin overconfident
+(predicted 0.93, actual 0.63). **Interpretation:** confidence is not currently a reliable
+basis for an auto-post threshold — the investigator is overconfident relative to hold-out
+accuracy (e.g. TDS 12.5%). Same pattern as the verifier finding: L3 self-assessment does
+not track correctness closely enough to gate autonomous posting.
+
+Cost (estimate): L3 44 × ~4k tok · L4 30 × ~1k tok · ~INR 13.3 at configured rates
+(`sbe cost --seed 9999`).
 
 ---
 
-## TDS_194O (hold-out n=7, Aug 31)
+## Cut list (explicit)
+
+- Rule graduation **promotion** workflow (detection only shipped)
+- `llm_calls_by_day` declining chart (needs multi-run progression)
+- Coverage curve / Q&A layer
+- Four L1-unsourced archetypes: `BANK_CUTOFF_ROLLOVER`, `DUPLICATE_UTR`,
+  `FX_ROUNDING_DRIFT`, `STATE_HOLIDAY_SHIFT`
+
+## Unlabeled OPEN history
+
+| Seed | Unlabeled OPEN | Note |
+|---|---|---|
+| 1001 (pre L1 fix) | 290 | Spurious |
+| 1001 (post L1 fix) | 57 | Cross-day residual |
+| 9999 hold-out | 3/64 (4.7%) | Noted, not fixed |
+
+---
+
+## TDS_194O (hold-out)
 
 - **Accuracy:** 1/7 (14.3%)
 - **Failure pattern:** Cites missing fee_gst and TDS together but abstains; only `BRK-2026-0313-0002` correct with tools
