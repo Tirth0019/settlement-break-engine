@@ -35,8 +35,10 @@ git diff behaviour-freeze HEAD -- \
 
 Post-freeze commits cover quota operations (Groq key rotation in
 `l3_investigator.py` — credential selection only; it does not change reasoning),
-scoring, and presentation. The hold-out seed 9999 was generated after the freeze
-and the agent never saw it during development.
+L4 *which-breaks-to-verify* selection order for hold-out allocation (not the
+verifier prompt or decision logic), scoring, and presentation. The hold-out seed
+9999 was generated after the freeze and the agent never saw it during
+development.
 
 If hold-out surfaces a frozen-path bug → `docs/KNOWN_ISSUES.md`. Do **not** patch.
 
